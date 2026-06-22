@@ -1,0 +1,14 @@
+{
+  "name": "united-movies-tools",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Builds the enriched United catalog feed published to GitHub Pages.",
+  "scripts": {
+    "build": "node build-catalog.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "puppeteer": "^23.11.1"
+  }
+}
