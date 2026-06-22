@@ -16,9 +16,12 @@
 import puppeteer from "puppeteer";
 import { createHash } from "node:crypto";
 import { writeFile, mkdir, appendFile } from "node:fs/promises";
-import { mapMovie, mapOMDb, mapWikidataAwards, movieKey } from "./lib.mjs";
+import { mapItem, mapOMDb, mapWikidataAwards, itemKey, ITEM_KINDS } from "./lib.mjs";
 
-const MOVIES_URL = "https://www.unitedprivatescreening.com/movies";
+const SECTION_URLS = [
+  "https://www.unitedprivatescreening.com/movies",
+  "https://www.unitedprivatescreening.com/tv",
+];
 const PAGES_URL = process.env.PAGES_URL || "https://funkmesh.github.io/united-movies-data/catalog.json";
 const OMDB_KEY = process.env.OMDB_API_KEY || "";
 const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
@@ -42,23 +45,27 @@ async function harvest() {
         const json = JSON.parse(await resp.text());
         const walk = (it) => {
           if (!it || typeof it !== "object") return;
-          if (it.template === "movie" && it.id) byId.set(it.id, it);
+          if (ITEM_KINDS[it.template] && it.id) byId.set(it.id, it);
           for (const k of it.child_items ?? it.items ?? []) walk(k);
         };
         for (const it of json.items ?? []) walk(it);
       } catch {}
     });
 
-    await page.goto(MOVIES_URL, { waitUntil: "networkidle2", timeout: 90000 });
-    for (let i = 0; i < 10; i++) {
-      await page.evaluate(() => window.scrollBy(0, 1400));
-      await sleep(700);
+    // Visit the Movies and TV sections so both content types are fetched.
+    for (const url of SECTION_URLS) {
+      await page.goto(url, { waitUntil: "networkidle2", timeout: 90000 });
+      for (let i = 0; i < 10; i++) {
+        await page.evaluate(() => window.scrollBy(0, 1400));
+        await sleep(700);
+      }
+      await sleep(2000);
     }
-    await sleep(2500);
 
-    const movies = [...byId.values()].map(mapMovie).filter(Boolean);
-    console.log(`harvested ${movies.length} movies`);
-    return movies;
+    const items = [...byId.values()].map(mapItem).filter(Boolean);
+    const movieCount = items.filter((m) => m.kind === "movie").length;
+    console.log(`harvested ${items.length} items (${movieCount} movies, ${items.length - movieCount} series)`);
+    return items;
   } finally {
     await browser.close();
   }
@@ -70,8 +77,8 @@ async function loadPrevious() {
     if (!resp.ok) return null;
     const json = await resp.json();
     const prev = new Map();
-    for (const m of json.movies ?? []) prev.set(movieKey(m), m);
-    console.log(`loaded ${prev.size} previously-published movies for reuse`);
+    for (const m of json.movies ?? []) prev.set(itemKey(m), m);
+    console.log(`loaded ${prev.size} previously-published items for reuse`);
     return { version: json.version, generatedAt: json.generatedAt, movies: prev };
   } catch {
     console.log("no previous feed (first run or unreachable)");
@@ -79,9 +86,10 @@ async function loadPrevious() {
   }
 }
 
-async function omdb(title, year) {
+async function omdb(title, year, kind) {
   if (!OMDB_KEY) return null;
-  const url = `https://www.omdbapi.com/?apikey=${OMDB_KEY}&t=${encodeURIComponent(title)}${year ? `&y=${year}` : ""}`;
+  const type = kind === "series" ? "&type=series" : "";
+  const url = `https://www.omdbapi.com/?apikey=${OMDB_KEY}&t=${encodeURIComponent(title)}${year ? `&y=${year}` : ""}${type}`;
   try {
     const resp = await fetch(url);
     if (!resp.ok) return null;
@@ -113,7 +121,7 @@ async function wikidataAwards(imdbID) {
 async function enrich(movies, previous) {
   let fetched = 0;
   for (const movie of movies) {
-    const prior = previous?.movies.get(movieKey(movie));
+    const prior = previous?.movies.get(itemKey(movie));
     if (prior && "imdbRating" in prior) {
       // Reuse prior enrichment so we only hit APIs for new titles.
       Object.assign(movie, {
@@ -130,7 +138,7 @@ async function enrich(movies, previous) {
       continue;
     }
 
-    const rating = await omdb(movie.title, movie.year);
+    const rating = await omdb(movie.title, movie.year, movie.kind);
     fetched++;
     if (rating) {
       Object.assign(movie, rating);

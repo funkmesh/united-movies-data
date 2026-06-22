@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mapMovie, mapOMDb, parseAwards, mapWikidataAwards, prettyGenre } from "./lib.mjs";
+import { mapItem, mapOMDb, parseAwards, mapWikidataAwards, prettyGenre } from "./lib.mjs";
 
-test("mapMovie maps a geemedia movie item onto the app shape", () => {
+test("mapItem maps a geemedia movie item onto the app shape", () => {
   const item = {
     template: "movie",
     id: "1",
@@ -20,10 +20,13 @@ test("mapMovie maps a geemedia movie item onto the app shape", () => {
     ],
     poster_image: { microportal_mobile: { "860x1272": ["https://cdn/x.jpg"] } },
   };
-  const m = mapMovie(item);
+  const m = mapItem(item);
+  assert.equal(m.kind, "movie");
   assert.equal(m.title, "The Moment");
   assert.equal(m.year, 2026);
   assert.equal(m.runtimeMinutes, 103);
+  assert.equal(m.seasonNumber, null);
+  assert.equal(m.episodeCount, null);
   assert.equal(m.director, "Aidan Zamiri");
   assert.deepEqual(m.cast, ["Charli XCX", "Alexander Skarsgard", "Isaac Cole Powell"]);
   assert.deepEqual(m.genres, ["Comedy", "Action & Adventure"]);
@@ -32,9 +35,42 @@ test("mapMovie maps a geemedia movie item onto the app shape", () => {
   assert.equal(m.posterURL, "https://cdn/x.jpg");
 });
 
-test("mapMovie drops non-movie entries and empty titles", () => {
-  assert.equal(mapMovie({ template: "section", title: "Home" }), null);
-  assert.equal(mapMovie({ template: "movie", title: "  " }), null);
+test("mapItem maps a tv_series with season/episode and no year/runtime", () => {
+  const item = {
+    template: "tv_series",
+    id: "2",
+    title: "A Knight of the Seven Kingdoms",
+    season_number: 1,
+    child_id_count: 6,
+    duration_minute: 50, // ignored for series
+    year: 2025,          // ignored for series
+    director_list: "Owen Harris",
+    cast_list: "Daniel Ings, Peter Claffey",
+    audio_language: ["eng"],
+    long_description: "From the world of Westeros.",
+    attributes: [
+      { name: "Drama", type: "genre" },
+      { name: "TVMA", type: "classification" },
+    ],
+    poster_image: { microportal_mobile: { "860x1272": ["https://cdn/s.jpg"] } },
+  };
+  const m = mapItem(item);
+  assert.equal(m.kind, "series");
+  assert.equal(m.title, "A Knight of the Seven Kingdoms");
+  assert.equal(m.seasonNumber, 1);
+  assert.equal(m.episodeCount, 6);
+  assert.equal(m.year, null, "series carry no single year");
+  assert.equal(m.runtimeMinutes, null, "series carry no single runtime");
+  assert.deepEqual(m.genres, ["Drama"]);
+  assert.equal(m.maturityRating, "TVMA");
+  assert.equal(m.language, "English");
+  assert.equal(m.director, "Owen Harris");
+});
+
+test("mapItem drops sections, tv_show umbrellas, and empty titles", () => {
+  assert.equal(mapItem({ template: "section", title: "Home" }), null);
+  assert.equal(mapItem({ template: "tv_show", title: "South Park" }), null);
+  assert.equal(mapItem({ template: "movie", title: "  " }), null);
 });
 
 test("prettyGenre normalizes concatenated genre names", () => {

@@ -82,9 +82,15 @@ function posterURL(item) {
   return preferred ? fromImage(preferred) : null;
 }
 
-/** Map a geemedia `content/items` entry to the app's Movie JSON (or null). */
-export function mapMovie(item) {
-  if (!item || item.template !== "movie") return null;
+/** Content templates we index as catalog entries, and the `kind` we tag each with. */
+export const ITEM_KINDS = { movie: "movie", tv_series: "series" };
+
+/** Map a geemedia `content/items` entry (movie or tv series) to the app's catalog
+ * JSON (or null for templates we don't index — sections, umbrella tv_show, etc.). */
+export function mapItem(item) {
+  if (!item) return null;
+  const kind = ITEM_KINDS[item.template];
+  if (!kind) return null;
   const title = (item.title ?? item.name ?? "").trim();
   if (!title) return null;
 
@@ -97,16 +103,21 @@ export function mapMovie(item) {
     else if (attr.type === "classification" && maturity == null) maturity = name;
   }
 
+  const isSeries = kind === "series";
   return {
+    kind,
     title,
-    year: intOrNull(item.year),
-    runtimeMinutes: intOrNull(item.duration_minute),
+    // Series have no single year/runtime; they carry season + episode counts instead.
+    year: isSeries ? null : intOrNull(item.year),
+    runtimeMinutes: isSeries ? null : intOrNull(item.duration_minute),
+    seasonNumber: isSeries ? intOrNull(item.season_number) : null,
+    episodeCount: isSeries ? intOrNull(item.child_id_count) : null,
     genres,
     maturityRating: maturity,
     synopsis: nonEmpty(item.long_description) ?? nonEmpty(item.synopsis),
     director: nameList(item.director_list)[0] ?? null,
     cast: nameList(item.cast_list),
-    language: languageName(item.movie_language),
+    language: languageName(isSeries ? item.audio_language : item.movie_language),
     posterURL: posterURL(item),
   };
 }
@@ -170,7 +181,8 @@ export function mapWikidataAwards(bindings) {
 
 // --- feed envelope ----------------------------------------------------------
 
-/** A stable key for the incremental enrichment cache (independent of app ids). */
-export function movieKey(m) {
-  return `${m.title.toLowerCase().trim()}|${m.year ?? ""}`;
+/** A stable key for the incremental enrichment cache (independent of app ids).
+ * Includes kind + year/season so series seasons that share a title don't collide. */
+export function itemKey(m) {
+  return `${m.kind ?? "movie"}|${m.title.toLowerCase().trim()}|${m.year ?? m.seasonNumber ?? ""}`;
 }
