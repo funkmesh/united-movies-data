@@ -1,6 +1,41 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mapItem, mapOMDb, parseAwards, mapWikidataAwards, prettyGenre } from "./lib.mjs";
+import {
+  mapItem, mapOMDb, parseAwards, mapWikidataAwards, prettyGenre,
+  cleanTitle, parseYear, yearWithin, pickSearchMatch,
+} from "./lib.mjs";
+
+test("cleanTitle strips a trailing (YYYY)", () => {
+  assert.equal(cleanTitle("The Running Man (2025)"), "The Running Man");
+  assert.equal(cleanTitle("Phantom Thread"), "Phantom Thread");
+  assert.equal(cleanTitle("Blade Runner 2049"), "Blade Runner 2049"); // year is part of the title
+});
+
+test("parseYear pulls a 4-digit year, even from a range", () => {
+  assert.equal(parseYear("2017"), 2017);
+  assert.equal(parseYear("2018–2020"), 2018);
+  assert.equal(parseYear("N/A"), null);
+});
+
+test("yearWithin tolerates small release-year disagreements", () => {
+  assert.equal(yearWithin("2018", 2017), true);   // Phantom Thread
+  assert.equal(yearWithin("1977", 2025), false);  // wrong film
+  assert.equal(yearWithin("2018", null), true);   // no wanted year -> lenient
+  assert.equal(yearWithin("N/A", 2017), true);    // unknown OMDb year -> lenient
+});
+
+test("pickSearchMatch chooses the year-closest candidate", () => {
+  // Mirrors the real "Star Wars: A New Hope" search result set.
+  const results = [
+    { Title: "Star Wars: Episode IV - A New Hope", Year: "1977", imdbID: "tt0076759" },
+    { Title: "Star Wars: ... Deleted Scenes", Year: "2011", imdbID: "tt8933914" },
+    { Title: "A Live Staged Reading ...", Year: "2025", imdbID: "tt36328088" },
+  ];
+  assert.equal(pickSearchMatch(results, 1977), "tt0076759");
+  assert.equal(pickSearchMatch(results, 2025), "tt36328088");
+  assert.equal(pickSearchMatch(results, 1990), null);     // nothing within tolerance
+  assert.equal(pickSearchMatch([], 1977), null);
+});
 
 test("mapItem maps a geemedia movie item onto the app shape", () => {
   const item = {

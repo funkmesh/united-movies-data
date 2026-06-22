@@ -122,6 +122,48 @@ export function mapItem(item) {
   };
 }
 
+// --- OMDb title matching ----------------------------------------------------
+
+/** Strip a trailing "(YYYY)" some United titles carry, e.g. "The Running Man (2025)". */
+export function cleanTitle(title) {
+  return String(title ?? "").replace(/\s*\((?:19|20)\d{2}\)\s*$/, "").trim();
+}
+
+/** First 4-digit year in an OMDb year string (handles ranges like "2017–2019"). */
+export function parseYear(value) {
+  const m = String(value ?? "").match(/(?:19|20)\d{2}/);
+  return m ? parseInt(m[0], 10) : null;
+}
+
+/** True if the OMDb year is within `tol` years of what we wanted (lenient when
+ * either side is unknown — United and OMDb often disagree by a year on release). */
+export function yearWithin(omdbYear, wantedYear, tol = 2) {
+  if (wantedYear == null) return true;
+  const y = parseYear(omdbYear);
+  if (y == null) return true;
+  return Math.abs(y - wantedYear) <= tol;
+}
+
+/** Choose the best imdbID from OMDb `s=` search results: the candidate whose year
+ * is closest to `wantedYear` (within `tol`). Returns null if none qualify. */
+export function pickSearchMatch(results, wantedYear, tol = 2) {
+  const items = (results ?? []).filter((r) => r && r.imdbID);
+  if (items.length === 0) return null;
+  if (wantedYear == null) return items[0].imdbID;
+  let best = null;
+  let bestDelta = Infinity;
+  for (const r of items) {
+    const y = parseYear(r.Year);
+    if (y == null) continue;
+    const delta = Math.abs(y - wantedYear);
+    if (delta <= tol && delta < bestDelta) {
+      best = r.imdbID;
+      bestDelta = delta;
+    }
+  }
+  return best;
+}
+
 // --- OMDb response -> rating/award enrichment -------------------------------
 
 /** Parse OMDb's free-text Awards string into a summary + coarse counts. */

@@ -16,7 +16,10 @@
 import puppeteer from "puppeteer";
 import { createHash } from "node:crypto";
 import { writeFile, mkdir, appendFile } from "node:fs/promises";
-import { mapItem, mapOMDb, mapWikidataAwards, itemKey, ITEM_KINDS } from "./lib.mjs";
+import {
+  mapItem, mapOMDb, mapWikidataAwards, itemKey, ITEM_KINDS,
+  cleanTitle, yearWithin, pickSearchMatch,
+} from "./lib.mjs";
 
 const SECTION_URLS = [
   "https://www.unitedprivatescreening.com/movies",
@@ -86,17 +89,45 @@ async function loadPrevious() {
   }
 }
 
-async function omdb(title, year, kind) {
-  if (!OMDB_KEY) return null;
-  const type = kind === "series" ? "&type=series" : "";
-  const url = `https://www.omdbapi.com/?apikey=${OMDB_KEY}&t=${encodeURIComponent(title)}${year ? `&y=${year}` : ""}${type}`;
+async function omdbRequest(params) {
+  const url = new URL("https://www.omdbapi.com/");
+  url.searchParams.set("apikey", OMDB_KEY);
+  for (const [key, value] of Object.entries(params)) {
+    if (value != null && value !== "") url.searchParams.set(key, value);
+  }
   try {
     const resp = await fetch(url);
     if (!resp.ok) return null;
-    return mapOMDb(await resp.json());
+    return await resp.json();
   } catch {
     return null;
   }
+}
+
+const found = (j) => j && j.Response !== "False";
+
+/// Layered OMDb match so titles like "Star Wars: A New Hope" (OMDb calls it
+/// "Episode IV"), "The Running Man (2025)" (United appends the year to the title),
+/// and "Phantom Thread" (United 2017 vs OMDb 2018) still resolve:
+///   1. exact title + year  2. exact title, year-tolerant  3. search + pick by year.
+async function omdb(rawTitle, year, kind) {
+  if (!OMDB_KEY) return null;
+  const title = cleanTitle(rawTitle);
+  const type = kind === "series" ? "series" : "movie";
+
+  let j = await omdbRequest({ t: title, y: year, type });
+  if (found(j)) return mapOMDb(j);
+
+  j = await omdbRequest({ t: title, type });
+  if (found(j) && yearWithin(j.Year, year)) return mapOMDb(j);
+
+  const search = await omdbRequest({ s: title, type });
+  const imdbID = pickSearchMatch(search?.Search, year);
+  if (imdbID) {
+    j = await omdbRequest({ i: imdbID });
+    if (found(j)) return mapOMDb(j);
+  }
+  return null;
 }
 
 async function wikidataAwards(imdbID) {
@@ -122,8 +153,10 @@ async function enrich(movies, previous) {
   let fetched = 0;
   for (const movie of movies) {
     const prior = previous?.movies.get(itemKey(movie));
-    if (prior && "imdbRating" in prior) {
-      // Reuse prior enrichment so we only hit APIs for new titles.
+    if (prior && prior.imdbRating != null) {
+      // Reuse only titles we already have a rating for; everything else (never
+      // matched, or matched but unrated) is retried each run so improved matching
+      // and newly-added OMDb ratings get picked up.
       Object.assign(movie, {
         imdbRating: prior.imdbRating ?? null,
         rating: prior.rating ?? prior.imdbRating ?? null,
