@@ -1,8 +1,9 @@
 name: Update catalog
 
-# Harvests United's catalog, enriches new titles (OMDb ratings + Wikidata awards),
-# and publishes the feed to GitHub Pages — but only redeploys when content changed
-# (keeps the ETag stable so the app gets cheap 304s).
+# Harvests each airline's catalog (United, American, Delta), enriches new titles
+# (OMDb ratings + Wikidata awards + descriptive backfill), and publishes per-airline
+# feeds to GitHub Pages — but only redeploys when some feed changed (keeps the ETag
+# stable so the app gets cheap 304s). A single airline failing doesn't fail the run.
 
 on:
   schedule:
@@ -21,6 +22,7 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

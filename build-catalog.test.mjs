@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import {
   mapItem, mapOMDb, parseAwards, mapWikidataAwards, prettyGenre,
   cleanTitle, parseYear, yearWithin, pickSearchMatch,
+  extractAmericanRecords, mapAmericanRecord, americanSystems, americanSystemsLegend,
+  decodeEntities, extractDeltaEntries, mapDeltaEntry,
+  omdbDescriptive, backfill, enrichKey, itemKey,
 } from "./lib.mjs";
 
 test("cleanTitle strips a trailing (YYYY)", () => {
@@ -150,6 +153,193 @@ test("parseAwards pulls oscar + total win counts", () => {
     { awardsSummary: "Won 2 Oscars. 134 wins & 89 nominations total", oscarWins: 2, awardWins: 134 });
   assert.deepEqual(parseAwards("Nominated for 3 BAFTA"),
     { awardsSummary: "Nominated for 3 BAFTA", oscarWins: null, awardWins: null });
+});
+
+// --- American (entertainment.aa.com flight payload) -------------------------
+
+// Build a page whose flight payload wraps one real movie record inside a larger object,
+// the way American's App Router output does — the wrapper must be dropped.
+function americanPage(rec) {
+  const payload = JSON.stringify({ page: 1, data: { movies: [rec] } });
+  const chunk = JSON.stringify(payload).slice(1, -1); // escape as a JS string body
+  return `<script>self.__next_f.push([1,"${chunk}"])</script>`;
+}
+
+const AA_REC = {
+  name: "Avatar: Fire and Ash",
+  object_id: "dd91ff4e-9644-4dd0-a2bd-149e7a4cc222",
+  director: "James Cameron",
+  duration: 197,
+  genres: ["Animation", "Action", "Adventure"],
+  imdb_id: "tt1757678",
+  mpaa_rating: null,
+  original_language: "English",
+  content_type: "Film",
+  season_number: null,
+  synopsis: "Return to Pandora for the third chapter.",
+  poster: "https://cdn.example/poster.jpg",
+};
+
+test("extractAmericanRecords pulls the movie record and drops its wrapper", () => {
+  const recs = extractAmericanRecords(americanPage(AA_REC));
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].name, "Avatar: Fire and Ash");
+  assert.equal(recs[0].imdb_id, "tt1757678");
+});
+
+test("extractAmericanRecords dedupes by object_id and ignores junk", () => {
+  const html = americanPage(AA_REC) + americanPage(AA_REC) + "<script>self.__next_f.push([1,\"noise\"])</script>";
+  assert.equal(extractAmericanRecords(html).length, 1);
+});
+
+test("mapAmericanRecord maps a film onto the app shape with an IMDb hint", () => {
+  const m = mapAmericanRecord(AA_REC);
+  assert.equal(m.kind, "movie");
+  assert.equal(m.title, "Avatar: Fire and Ash");
+  assert.equal(m.year, null, "American omits release year (backfilled from OMDb)");
+  assert.equal(m.runtimeMinutes, 197);
+  assert.deepEqual(m.genres, ["Animation", "Action", "Adventure"]);
+  assert.equal(m.director, "James Cameron");
+  assert.deepEqual(m.cast, [], "American omits cast (backfilled from OMDb)");
+  assert.equal(m.language, "English");
+  assert.equal(m.imdbID, "tt1757678");
+  assert.equal(m.posterURL, "https://cdn.example/poster.jpg");
+});
+
+test("mapAmericanRecord treats a season_number record as a series", () => {
+  const m = mapAmericanRecord({ ...AA_REC, content_type: "TV", season_number: 2, duration: 45 });
+  assert.equal(m.kind, "series");
+  assert.equal(m.seasonNumber, 2);
+  assert.equal(m.runtimeMinutes, null);
+});
+
+// A record carrying the nested IFE-system structure American actually publishes.
+const AA_REC_SYS = {
+  ...AA_REC,
+  object_id: "with-systems",
+  summaries: [{
+    programming: [{
+      systems_fk_oem_systems: ["5", "24"],
+      systems: [
+        { id: 5, system: "Viasat W-IFE", system_name: "W-IFE", oem_short_name: "Viasat", is_seatback: false, is_device: true },
+        { id: 24, system: "PAC eX3", system_name: "eX3", oem_short_name: "PAC", is_seatback: true, is_device: false },
+        { id: 5, system: "Viasat W-IFE", system_name: "W-IFE", oem_short_name: "Viasat", is_seatback: false, is_device: true }, // dup id
+      ],
+    }],
+  }],
+};
+
+test("americanSystems extracts deduped, sorted systems with seatback/device flags", () => {
+  const sys = americanSystems(AA_REC_SYS);
+  assert.deepEqual(sys.map((s) => s.id), [5, 24]);
+  assert.deepEqual(sys[0], { id: 5, system: "Viasat W-IFE", name: "W-IFE", oem: "Viasat", seatback: false, device: true });
+  assert.equal(sys[1].seatback, true);
+});
+
+test("americanSystems falls back to the flat id list when rich objects are absent", () => {
+  const rec = { summaries: [{ programming: [{ systems_fk_oem_systems: ["6", "38"] }] }] };
+  assert.deepEqual(americanSystems(rec).map((s) => s.id), [6, 38]);
+  assert.equal(americanSystems({}).length, 0);
+});
+
+test("mapAmericanRecord tags the title with its systemIds (for flight matching)", () => {
+  assert.deepEqual(mapAmericanRecord(AA_REC_SYS).systemIds, [5, 24]);
+  assert.deepEqual(mapAmericanRecord(AA_REC).systemIds, [], "no systems -> empty");
+});
+
+test("americanSystemsLegend unions systems across records", () => {
+  const legend = americanSystemsLegend([
+    AA_REC_SYS,
+    { summaries: [{ programming: [{ systems: [{ id: 6, system: "Thales Olympus", system_name: "Olympus", oem_short_name: "Thales", is_seatback: false, is_device: false }] }] }] },
+  ]);
+  assert.deepEqual(legend.map((s) => s.id), [5, 6, 24]);
+  assert.equal(legend.find((s) => s.id === 6).oem, "Thales");
+});
+
+// --- Delta (delta.com current-movies HTML) ----------------------------------
+
+test("decodeEntities decodes numeric and named HTML entities", () => {
+  assert.equal(decodeEntities("Copa &#39;71"), "Copa '71");
+  assert.equal(decodeEntities("Tom &amp; Jerry"), "Tom & Jerry");
+  assert.equal(decodeEntities("Caf&#xe9;"), "Café");
+});
+
+test("extractDeltaEntries pulls deduped title + absolute poster", () => {
+  // Delta renders each poster twice (responsive variants) with the same title attr.
+  const html = `
+    <img src="/content/dam/delta-com/products/movie-thumbs/june-2026/coco-180x250.jpg" title="Coco" class="md-d-none" alt="Coco Poster"/>
+    <img src="/content/dam/delta-com/products/movie-thumbs/june-2026/coco-180x250.jpg" title="Coco" alt="Coco Poster"/>
+    <img src="/content/dam/delta-com/products/movie-thumbs/june-2026/copa71-180x250.jpg" title="Copa &#39;71" alt="Copa '71 Poster"/>
+    <img src="/content/dam/other/logo.png" title="Not a movie" alt="logo"/>`;
+  const entries = extractDeltaEntries(html);
+  assert.equal(entries.length, 2, "deduped, and the non-thumbs image is ignored");
+  assert.deepEqual(entries[0], { title: "Coco", posterURL: "https://www.delta.com/content/dam/delta-com/products/movie-thumbs/june-2026/coco-180x250.jpg" });
+  assert.equal(entries[1].title, "Copa '71");
+});
+
+test("mapDeltaEntry leaves everything but title/poster null for OMDb backfill", () => {
+  const m = mapDeltaEntry({ title: "Coco", posterURL: "https://x/coco.jpg" });
+  assert.equal(m.kind, "movie");
+  assert.equal(m.title, "Coco");
+  assert.equal(m.posterURL, "https://x/coco.jpg");
+  assert.deepEqual(m.genres, []);
+  assert.equal(m.director, null);
+  assert.equal(m.year, null);
+});
+
+// --- OMDb descriptive backfill ----------------------------------------------
+
+const OMDB_FULL = {
+  Response: "True",
+  Year: "2017",
+  Runtime: "130 min",
+  Genre: "Drama, Romance",
+  Director: "Luca Guadagnino",
+  Actors: "Armie Hammer, Timothée Chalamet, Michael Stuhlbarg",
+  Plot: "A romance in 1980s Italy.",
+  Language: "English, Italian, French",
+  Rated: "R",
+};
+
+test("omdbDescriptive parses the non-rating fields", () => {
+  const d = omdbDescriptive(OMDB_FULL);
+  assert.equal(d.year, 2017);
+  assert.equal(d.runtimeMinutes, 130);
+  assert.deepEqual(d.genres, ["Drama", "Romance"]);
+  assert.equal(d.director, "Luca Guadagnino");
+  assert.deepEqual(d.cast, ["Armie Hammer", "Timothée Chalamet", "Michael Stuhlbarg"]);
+  assert.equal(d.language, "English", "first language only");
+  assert.equal(d.maturityRating, "R");
+  assert.deepEqual(omdbDescriptive({ Response: "False" }), {});
+});
+
+test("backfill fills empty fields but never overrides source-provided ones", () => {
+  const sparse = mapDeltaEntry({ title: "Call Me by Your Name", posterURL: "p" });
+  backfill(sparse, omdbDescriptive(OMDB_FULL));
+  assert.equal(sparse.year, 2017);
+  assert.deepEqual(sparse.genres, ["Drama", "Romance"]);
+  assert.equal(sparse.director, "Luca Guadagnino");
+
+  const rich = mapAmericanRecord(AA_REC); // already has genres + director
+  backfill(rich, omdbDescriptive(OMDB_FULL));
+  assert.deepEqual(rich.genres, ["Animation", "Action", "Adventure"], "kept source genres");
+  assert.equal(rich.director, "James Cameron", "kept source director");
+  assert.deepEqual(rich.cast, ["Armie Hammer", "Timothée Chalamet", "Michael Stuhlbarg"], "backfilled missing cast");
+  assert.equal(rich.year, 2017, "backfilled missing year");
+});
+
+test("backfill keeps series year/runtime null", () => {
+  const series = { kind: "series", title: "X", year: null, runtimeMinutes: null, seasonNumber: 1, genres: [], cast: [], director: null, synopsis: null, language: null, maturityRating: null };
+  backfill(series, omdbDescriptive(OMDB_FULL));
+  assert.equal(series.year, null);
+  assert.equal(series.runtimeMinutes, null);
+  assert.equal(series.director, "Luca Guadagnino", "non year/runtime fields still backfill");
+});
+
+test("enrichKey prefers a source IMDb id, else the per-title key", () => {
+  assert.equal(enrichKey(mapAmericanRecord(AA_REC)), "i:tt1757678");
+  const delta = mapDeltaEntry({ title: "Coco", posterURL: "p" });
+  assert.equal(enrichKey(delta), itemKey(delta));
 });
 
 test("mapWikidataAwards splits 'X for Y' labels and dedupes", () => {

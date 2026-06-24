@@ -221,10 +221,215 @@ export function mapWikidataAwards(bindings) {
   return out;
 }
 
+// --- American (entertainment.aa.com) flight payload -> records --------------
+
+/** Concatenate the Next.js App Router "flight" chunks the page embeds for itself. */
+function decodeFlight(html) {
+  let buf = "";
+  for (const m of String(html).matchAll(/self\.__next_f\.push\(\[1,"(.*?)"\]\)/gs)) {
+    try { buf += JSON.parse(`"${m[1]}"`); } catch {}
+  }
+  return buf;
+}
+
+/** Extract American's movie record objects from a movies page. Balanced-brace scan
+ * over the decoded flight buffer, keeping objects that JSON-parse and carry a
+ * top-level name + object_id + duration (drops the page-sized wrappers around them). */
+export function extractAmericanRecords(html) {
+  const buf = decodeFlight(html);
+  const out = new Map();
+  const stack = [];
+  let instr = false, esc = false;
+  for (let i = 0; i < buf.length; i++) {
+    const ch = buf[i];
+    if (instr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') instr = false;
+      continue;
+    }
+    if (ch === '"') instr = true;
+    else if (ch === "{") stack.push(i);
+    else if (ch === "}" && stack.length) {
+      const start = stack.pop();
+      if (i + 1 - start > 50000) continue; // skip the page-sized wrappers, keep records
+      const obj = buf.slice(start, i + 1);
+      if (!obj.includes('"object_id":"') || !obj.includes('"name":"')) continue;
+      let d;
+      try { d = JSON.parse(obj); } catch { continue; }
+      if (typeof d.name === "string" && d.object_id && d.duration != null) out.set(d.object_id, d);
+    }
+  }
+  return [...out.values()];
+}
+
+/** The onboard IFE systems a title is available on, deduped by id, from a record's
+ * nested summaries/programming. Each: { id, system, name, oem, seatback, device }.
+ * Per-flight availability is a function of which system a given aircraft carries, so
+ * tagging titles with their system ids lets the app filter to a specific flight. */
+export function americanSystems(rec) {
+  const byId = new Map();
+  for (const sm of rec?.summaries ?? []) {
+    for (const pg of sm?.programming ?? []) {
+      for (const s of pg?.systems ?? []) {
+        if (s?.id != null && !byId.has(s.id)) {
+          byId.set(s.id, {
+            id: s.id,
+            system: nonEmpty(s.system),
+            name: nonEmpty(s.system_name),
+            oem: nonEmpty(s.oem_short_name),
+            seatback: typeof s.is_seatback === "boolean" ? s.is_seatback : null,
+            device: typeof s.is_device === "boolean" ? s.is_device : null,
+          });
+        }
+      }
+      // Fallback to the flat id list when the rich objects are absent.
+      for (const raw of pg?.systems_fk_oem_systems ?? []) {
+        const id = intOrNull(raw);
+        if (id != null && !byId.has(id)) byId.set(id, { id, system: null, name: null, oem: null, seatback: null, device: null });
+      }
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.id - b.id);
+}
+
+/** Union of every IFE system seen across a set of American records — the legend the
+ * feed publishes once so the app can resolve a title's `systemIds` to names/seatback. */
+export function americanSystemsLegend(records) {
+  const byId = new Map();
+  for (const rec of records ?? []) {
+    for (const s of americanSystems(rec)) if (!byId.has(s.id)) byId.set(s.id, s);
+  }
+  return [...byId.values()].sort((a, b) => a.id - b.id);
+}
+
+/** Map an American record to the app's catalog shape. American omits release year and
+ * cast, so those are backfilled from OMDb; it does provide the IMDb id, which we keep
+ * as a hint so enrichment can match by id instead of by title. `systemIds` tags which
+ * onboard IFE systems carry the title (see americanSystems / the feed's systems legend). */
+export function mapAmericanRecord(rec) {
+  if (!rec || typeof rec.name !== "string") return null;
+  const title = rec.name.trim();
+  if (!title) return null;
+  const isSeries = rec.content_type === "TV" || rec.season_number != null;
+  return {
+    kind: isSeries ? "series" : "movie",
+    title,
+    year: null,
+    runtimeMinutes: isSeries ? null : intOrNull(rec.duration),
+    seasonNumber: isSeries ? intOrNull(rec.season_number) : null,
+    episodeCount: null,
+    genres: nameList(rec.genres).map(prettyGenre),
+    maturityRating: nonEmpty(rec.mpaa_rating),
+    synopsis: nonEmpty(rec.synopsis),
+    director: nameList(rec.director)[0] ?? null,
+    cast: nameList(rec.cast_list ?? rec.cast),
+    language: nonEmpty(rec.original_language),
+    posterURL: nonEmpty(rec.poster),
+    imdbID: /^tt\d+$/.test(rec.imdb_id ?? "") ? rec.imdb_id : null,
+    systemIds: americanSystems(rec).map((s) => s.id),
+  };
+}
+
+// --- Delta (delta.com current-movies) HTML -> entries -----------------------
+
+const NAMED_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+
+/** Decode the handful of HTML entities Delta's title attributes carry (e.g. "Copa &#39;71"). */
+export function decodeEntities(s) {
+  return String(s ?? "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (m, code) => {
+    if (code[0] === "#") {
+      const n = /^#x/i.test(code) ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
+      return Number.isFinite(n) ? String.fromCodePoint(n) : m;
+    }
+    return NAMED_ENTITIES[code.toLowerCase()] ?? m;
+  });
+}
+
+/** Parse Delta's current-movies page into [{title, posterURL}]. Delta exposes only a
+ * title + poster per entry (the rest is backfilled from OMDb), and renders each twice
+ * for responsive layout, so we dedupe by title. */
+export function extractDeltaEntries(html, base = "https://www.delta.com") {
+  const seen = new Map();
+  const re = /<img\s+src="(\/content\/dam\/delta-com\/products\/[^"]*thumbs[^"]+)"\s+title="([^"]+)"/g;
+  for (const m of String(html).matchAll(re)) {
+    const title = decodeEntities(m[2]).trim();
+    if (title && !seen.has(title)) seen.set(title, base + m[1]);
+  }
+  return [...seen.entries()].map(([title, posterURL]) => ({ title, posterURL }));
+}
+
+/** Map a Delta entry to the app's catalog shape (everything but title/poster is null,
+ * to be backfilled from OMDb). */
+export function mapDeltaEntry(entry) {
+  const title = (entry?.title ?? "").trim();
+  if (!title) return null;
+  return {
+    kind: "movie",
+    title,
+    year: null,
+    runtimeMinutes: null,
+    seasonNumber: null,
+    episodeCount: null,
+    genres: [],
+    maturityRating: null,
+    synopsis: null,
+    director: null,
+    cast: [],
+    language: null,
+    posterURL: entry.posterURL ?? null,
+  };
+}
+
+// --- OMDb descriptive backfill (for sources that omit metadata) -------------
+
+function firstLanguage(v) {
+  return nonEmpty(nameList(v === "N/A" ? "" : v)[0] ?? "");
+}
+
+/** Pull the descriptive (non-rating) fields from an OMDb response, so sources that omit
+ * them (Delta, American) can be enriched to parity with United. */
+export function omdbDescriptive(j) {
+  if (!j || j.Response === "False") return {};
+  const rt = /(\d+)\s*min/i.exec(j.Runtime ?? "");
+  return {
+    year: parseYear(j.Year),
+    runtimeMinutes: rt ? parseInt(rt[1], 10) : null,
+    genres: nameList(j.Genre === "N/A" ? "" : j.Genre).map(prettyGenre),
+    director: nameList(j.Director === "N/A" ? "" : j.Director)[0] ?? null,
+    cast: nameList(j.Actors === "N/A" ? "" : j.Actors),
+    synopsis: nonEmpty(j.Plot === "N/A" ? "" : j.Plot),
+    language: firstLanguage(j.Language),
+    maturityRating: nonEmpty(j.Rated === "N/A" ? "" : j.Rated),
+  };
+}
+
+/** Fill catalog fields the airline source left empty from OMDb's descriptive data.
+ * Never overrides a value the source already provided; series keep null year/runtime. */
+export function backfill(movie, d) {
+  if (!d) return movie;
+  const empty = (v) => v == null || v === "" || (Array.isArray(v) && v.length === 0);
+  const scalarKeys = movie.kind === "series"
+    ? ["director", "synopsis", "language", "maturityRating"]
+    : ["year", "runtimeMinutes", "director", "synopsis", "language", "maturityRating"];
+  for (const k of scalarKeys) {
+    if (empty(movie[k]) && !empty(d[k])) movie[k] = d[k];
+  }
+  if (empty(movie.genres) && d.genres?.length) movie.genres = d.genres;
+  if (empty(movie.cast) && d.cast?.length) movie.cast = d.cast;
+  return movie;
+}
+
 // --- feed envelope ----------------------------------------------------------
 
 /** A stable key for the incremental enrichment cache (independent of app ids).
  * Includes kind + year/season so series seasons that share a title don't collide. */
 export function itemKey(m) {
   return `${m.kind ?? "movie"}|${m.title.toLowerCase().trim()}|${m.year ?? m.seasonNumber ?? ""}`;
+}
+
+/** Key for the in-run cross-airline enrichment cache: prefer a source-provided IMDb id
+ * (American), else fall back to the per-title key. */
+export function enrichKey(m) {
+  return m.imdbID ? `i:${m.imdbID}` : itemKey(m);
 }

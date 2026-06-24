@@ -1,9 +1,9 @@
 {
-  "name": "united-movies-tools",
+  "name": "inflight-movies-tools",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Builds the enriched United catalog feed published to GitHub Pages.",
+  "description": "Builds enriched inflight catalog feeds for US airlines (United, American, Delta), published to GitHub Pages.",
   "scripts": {
     "build": "node build-catalog.mjs",
     "test": "node --test"

@@ -1,90 +1,51 @@
-// Builds the enriched catalog feed the app consumes.
+// Builds the enriched catalog feeds the app consumes — one per airline.
 //
-// 1. Harvest United's catalog by running the real Angular SPA in headless Chrome
-//    and collecting the `content/items` JSON it fetches for itself.
+// 1. Harvest each airline's public catalog via its source adapter (sources/*.mjs).
+//    Adapters are heterogeneous: United runs its Angular SPA in headless Chrome;
+//    American and Delta are fetched and parsed server-side.
 // 2. Enrich each *new* title with OMDb ratings (IMDb / Rotten Tomatoes / Metacritic)
-//    + an awards summary, and named awards from Wikidata (matched by IMDb id).
-//    Enrichment for titles already present in the previously published feed is reused
-//    so we only hit the APIs for genuinely new movies.
-// 3. Write dist/catalog.json as `{ version, generatedAt, month, movies }`, where
-//    `version` is a content hash excluding `generatedAt`; emit `changed` so the
-//    workflow only redeploys (and changes the ETag) when content actually changed.
+//    + an awards summary, named awards from Wikidata (matched by IMDb id), and — for
+//    sources that omit them — descriptive fields (genres/cast/synopsis/…) backfilled
+//    from OMDb. Enrichment for titles already in an airline's published feed is reused,
+//    and an in-run cache shares results across airlines, so we only hit the APIs for
+//    genuinely new titles.
+// 3. Write dist/<id>.json per airline as `{ id, displayName, version, generatedAt,
+//    month, movies }` (version is a content hash excluding generatedAt), a
+//    dist/index.json manifest, and dist/catalog.json as a United alias (back-compat).
+//    Emit `changed` so the workflow only redeploys when some feed actually changed.
+//
+// If one airline's harvest fails, its previously-published feed is kept and the run
+// continues; the run only fails if every airline fails.
 //
 // Env: OMDB_API_KEY (required for enrichment; absent => ratings/awards left null).
-//      PAGES_URL (optional; defaults to the production GitHub Pages feed URL).
+//      PAGES_BASE   (optional; base URL of the published feeds, for prior-feed reuse).
+//      SOURCES      (optional; comma list of airline ids to build, e.g. "delta").
 
-import puppeteer from "puppeteer";
 import { createHash } from "node:crypto";
 import { writeFile, mkdir, appendFile } from "node:fs/promises";
 import {
-  mapItem, mapOMDb, mapWikidataAwards, itemKey, ITEM_KINDS,
-  cleanTitle, yearWithin, pickSearchMatch,
+  mapOMDb, mapWikidataAwards, itemKey, enrichKey, cleanTitle, yearWithin,
+  pickSearchMatch, omdbDescriptive, backfill,
 } from "./lib.mjs";
+import SOURCES from "./sources/index.mjs";
 
-const SECTION_URLS = [
-  "https://www.unitedprivatescreening.com/movies",
-  "https://www.unitedprivatescreening.com/tv",
-];
-const PAGES_URL = process.env.PAGES_URL || "https://funkmesh.github.io/united-movies-data/catalog.json";
+const PAGES_BASE = process.env.PAGES_BASE || "https://funkmesh.github.io/united-movies-data";
 const OMDB_KEY = process.env.OMDB_API_KEY || "";
-const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
-const WIKIDATA_UA = "united-movie-picker/1.0 (catalog enrichment; https://github.com/funkmesh/united-movies)";
+const WIKIDATA_UA = "inflight-movie-picker/1.0 (catalog enrichment; https://github.com/funkmesh/united-movies-data)";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function harvest() {
-  const browser = await puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
-  });
+async function loadPrevious(id) {
   try {
-    const page = await browser.newPage();
-    await page.setUserAgent(UA);
-
-    const byId = new Map();
-    page.on("response", async (resp) => {
-      if (!/api\/v3\/content\/items/.test(resp.url()) || resp.status() !== 200) return;
-      try {
-        const json = JSON.parse(await resp.text());
-        const walk = (it) => {
-          if (!it || typeof it !== "object") return;
-          if (ITEM_KINDS[it.template] && it.id) byId.set(it.id, it);
-          for (const k of it.child_items ?? it.items ?? []) walk(k);
-        };
-        for (const it of json.items ?? []) walk(it);
-      } catch {}
-    });
-
-    // Visit the Movies and TV sections so both content types are fetched.
-    for (const url of SECTION_URLS) {
-      await page.goto(url, { waitUntil: "networkidle2", timeout: 90000 });
-      for (let i = 0; i < 10; i++) {
-        await page.evaluate(() => window.scrollBy(0, 1400));
-        await sleep(700);
-      }
-      await sleep(2000);
-    }
-
-    const items = [...byId.values()].map(mapItem).filter(Boolean);
-    const movieCount = items.filter((m) => m.kind === "movie").length;
-    console.log(`harvested ${items.length} items (${movieCount} movies, ${items.length - movieCount} series)`);
-    return items;
-  } finally {
-    await browser.close();
-  }
-}
-
-async function loadPrevious() {
-  try {
-    const resp = await fetch(PAGES_URL, { headers: { "User-Agent": WIKIDATA_UA } });
+    const resp = await fetch(`${PAGES_BASE}/${id}.json`, { headers: { "User-Agent": WIKIDATA_UA } });
     if (!resp.ok) return null;
     const json = await resp.json();
-    const prev = new Map();
-    for (const m of json.movies ?? []) prev.set(itemKey(m), m);
-    console.log(`loaded ${prev.size} previously-published items for reuse`);
-    return { version: json.version, generatedAt: json.generatedAt, movies: prev };
+    const movies = new Map();
+    for (const m of json.movies ?? []) movies.set(itemKey(m), m);
+    console.log(`  loaded ${movies.size} previously-published ${id} titles for reuse`);
+    return { version: json.version, generatedAt: json.generatedAt, movies, raw: json };
   } catch {
-    console.log("no previous feed (first run or unreachable)");
+    console.log(`  no previous ${id} feed (first run or unreachable)`);
     return null;
   }
 }
@@ -106,26 +67,31 @@ async function omdbRequest(params) {
 
 const found = (j) => j && j.Response !== "False";
 
-/// Layered OMDb match so titles like "Star Wars: A New Hope" (OMDb calls it
-/// "Episode IV"), "The Running Man (2025)" (United appends the year to the title),
-/// and "Phantom Thread" (United 2017 vs OMDb 2018) still resolve:
-///   1. exact title + year  2. exact title, year-tolerant  3. search + pick by year.
-async function omdb(rawTitle, year, kind) {
+/// Resolve a title to its OMDb record (raw JSON). When the source already gives us an
+/// IMDb id (American), match by id directly — most accurate. Otherwise use the layered
+/// title match so "Star Wars: A New Hope" (OMDb "Episode IV"), "The Running Man (2025)"
+/// (a year baked into the title), and "Phantom Thread" (2017 vs OMDb 2018) still resolve.
+async function omdb(movie) {
   if (!OMDB_KEY) return null;
-  const title = cleanTitle(rawTitle);
-  const type = kind === "series" ? "series" : "movie";
+  if (movie.imdbID) {
+    const j = await omdbRequest({ i: movie.imdbID });
+    return found(j) ? j : null;
+  }
+  const title = cleanTitle(movie.title);
+  const type = movie.kind === "series" ? "series" : "movie";
+  const year = movie.year;
 
   let j = await omdbRequest({ t: title, y: year, type });
-  if (found(j)) return mapOMDb(j);
+  if (found(j)) return j;
 
   j = await omdbRequest({ t: title, type });
-  if (found(j) && yearWithin(j.Year, year)) return mapOMDb(j);
+  if (found(j) && yearWithin(j.Year, year)) return j;
 
   const search = await omdbRequest({ s: title, type });
   const imdbID = pickSearchMatch(search?.Search, year);
   if (imdbID) {
     j = await omdbRequest({ i: imdbID });
-    if (found(j)) return mapOMDb(j);
+    if (found(j)) return j;
   }
   return null;
 }
@@ -149,43 +115,81 @@ async function wikidataAwards(imdbID) {
   }
 }
 
-async function enrich(movies, previous) {
-  let fetched = 0;
+/** Fetch + assemble the enrichment for one title (rating fields, OMDb descriptive data
+ * for backfill, and Wikidata awards). Shape is cached and reused across airlines. */
+async function fetchEnrichment(movie) {
+  const j = await omdb(movie);
+  if (!j) return { rating: null, descriptive: {}, awards: [] };
+  const rating = mapOMDb(j);
+  const descriptive = omdbDescriptive(j);
+  let awards = [];
+  if (rating?.imdbID) {
+    awards = await wikidataAwards(rating.imdbID);
+    await sleep(200); // be polite to Wikidata
+  }
+  return { rating, descriptive, awards };
+}
+
+/** Apply an enrichment result to a movie: rating fields + descriptive backfill. Keeps a
+ * source-provided IMDb id even if OMDb returned no record. */
+function applyEnrichment(movie, enr) {
+  const r = enr.rating;
+  Object.assign(movie, {
+    imdbRating: r?.imdbRating ?? null,
+    rating: r?.rating ?? r?.imdbRating ?? null,
+    rottenTomatoes: r?.rottenTomatoes ?? null,
+    metascore: r?.metascore ?? null,
+    imdbID: r?.imdbID ?? movie.imdbID ?? null,
+    awardsSummary: r?.awardsSummary ?? null,
+    oscarWins: r?.oscarWins ?? null,
+    awardWins: r?.awardWins ?? null,
+    awards: enr.awards ?? [],
+  });
+  backfill(movie, enr.descriptive);
+}
+
+async function enrich(movies, previous, cache) {
+  let fetched = 0, cacheHits = 0, reused = 0;
   for (const movie of movies) {
     const prior = previous?.movies.get(itemKey(movie));
     if (prior && prior.imdbRating != null) {
-      // Reuse only titles we already have a rating for; everything else (never
-      // matched, or matched but unrated) is retried each run so improved matching
-      // and newly-added OMDb ratings get picked up.
+      // Reuse only titles we already have a rating for; everything else (never matched,
+      // or matched but unrated) is retried each run so improved matching and newly-added
+      // ratings get picked up. Descriptive fields from the prior feed are reused too.
       Object.assign(movie, {
         imdbRating: prior.imdbRating ?? null,
         rating: prior.rating ?? prior.imdbRating ?? null,
         rottenTomatoes: prior.rottenTomatoes ?? null,
         metascore: prior.metascore ?? null,
-        imdbID: prior.imdbID ?? null,
+        imdbID: prior.imdbID ?? movie.imdbID ?? null,
         awardsSummary: prior.awardsSummary ?? null,
         oscarWins: prior.oscarWins ?? null,
         awardWins: prior.awardWins ?? null,
         awards: prior.awards ?? [],
       });
+      backfill(movie, {
+        year: prior.year, runtimeMinutes: prior.runtimeMinutes, genres: prior.genres,
+        director: prior.director, cast: prior.cast, synopsis: prior.synopsis,
+        language: prior.language, maturityRating: prior.maturityRating,
+      });
+      reused++;
       continue;
     }
 
-    const rating = await omdb(movie.title, movie.year, movie.kind);
-    fetched++;
-    if (rating) {
-      Object.assign(movie, rating);
-      movie.awards = await wikidataAwards(rating.imdbID);
-      await sleep(200); // be polite to Wikidata
+    const key = enrichKey(movie);
+    let enr = cache.get(key);
+    if (enr) {
+      cacheHits++;
     } else {
-      Object.assign(movie, {
-        imdbRating: null, rating: null, rottenTomatoes: null, metascore: null,
-        imdbID: null, awardsSummary: null, oscarWins: null, awardWins: null, awards: [],
-      });
+      enr = await fetchEnrichment(movie);
+      cache.set(key, enr);
+      if (enr.rating?.imdbID) cache.set(`i:${enr.rating.imdbID}`, enr); // share across airlines
+      fetched++;
+      await sleep(120); // be polite to OMDb
     }
-    await sleep(120); // be polite to OMDb
+    applyEnrichment(movie, enr);
   }
-  console.log(`enriched ${fetched} new titles via OMDb/Wikidata (${movies.length - fetched} reused)`);
+  console.log(`  enriched ${fetched} new via OMDb/Wikidata (${cacheHits} cache hits, ${reused} reused)`);
 }
 
 function stableStringify(value) {
@@ -196,26 +200,81 @@ function stableStringify(value) {
   );
 }
 
+/** Build one airline's feed. On harvest failure, returns the previously-published feed
+ * (so a transient failure doesn't wipe data); returns null only if there's nothing to
+ * fall back on. The boolean `changed` is whether this airline's content changed. */
+async function buildAirline(adapter, cache) {
+  const { id, displayName } = adapter;
+  console.log(`\n=== ${displayName} (${id}) ===`);
+  const previous = await loadPrevious(id);
+  try {
+    // Adapters return either an array of titles or { items, envelope } where envelope
+    // carries extra airline-specific feed fields (e.g. American's IFE system legend).
+    const harvested = await adapter.harvest();
+    const movies = Array.isArray(harvested) ? harvested : (harvested?.items ?? []);
+    const envelope = Array.isArray(harvested) ? {} : (harvested?.envelope ?? {});
+    if (movies.length === 0) throw new Error("harvest returned 0 items");
+    movies.sort((a, b) => a.title.localeCompare(b.title));
+    const movieCount = movies.filter((m) => m.kind === "movie").length;
+    console.log(`  harvested ${movies.length} items (${movieCount} movies, ${movies.length - movieCount} series)`);
+
+    await enrich(movies, previous, cache);
+
+    const version = createHash("sha256").update(stableStringify({ ...envelope, movies })).digest("hex").slice(0, 16);
+    const changed = !previous || previous.version !== version;
+    const generatedAt = changed ? new Date().toISOString() : (previous?.generatedAt ?? new Date().toISOString());
+    const month = new Date().toLocaleString("en-US", { month: "long", year: "numeric" });
+    console.log(`  version ${version}, changed=${changed}, ${movies.length} titles`);
+    return { feed: { id, displayName, version, generatedAt, month, ...envelope, movies }, changed, ok: true };
+  } catch (err) {
+    console.error(`  ✗ ${id} failed: ${err.message}`);
+    if (previous?.raw) {
+      console.log(`  reusing previously-published ${id}.json (${(previous.raw.movies ?? []).length} titles)`);
+      return { feed: previous.raw, changed: false, ok: false };
+    }
+    console.log(`  no previous ${id} feed to fall back on — skipping`);
+    return { feed: null, changed: false, ok: false };
+  }
+}
+
 async function main() {
-  const movies = await harvest();
-  if (movies.length === 0) throw new Error("harvest returned 0 movies — aborting (likely blocked or page changed)");
-  movies.sort((a, b) => a.title.localeCompare(b.title));
+  const only = (process.env.SOURCES || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const adapters = only.length ? SOURCES.filter((s) => only.includes(s.id)) : SOURCES;
+  if (adapters.length === 0) throw new Error(`no matching sources for SOURCES=${process.env.SOURCES}`);
 
-  const previous = await loadPrevious();
-  await enrich(movies, previous);
-
-  const version = createHash("sha256").update(stableStringify(movies)).digest("hex").slice(0, 16);
-  const changed = !previous || previous.version !== version;
-  const generatedAt = changed ? new Date().toISOString() : (previous?.generatedAt ?? new Date().toISOString());
-  const month = new Date().toLocaleString("en-US", { month: "long", year: "numeric" });
-
-  const feed = { version, generatedAt, month, movies };
   await mkdir("dist", { recursive: true });
-  await writeFile("dist/catalog.json", JSON.stringify(feed, null, 2));
-  console.log(`wrote dist/catalog.json — version ${version}, changed=${changed}, ${movies.length} movies`);
+  const cache = new Map();
+  const manifest = [];
+  const failures = [];
+  let anyChanged = false;
+  let unitedFeed = null;
 
+  for (const adapter of adapters) {
+    const { feed, changed, ok } = await buildAirline(adapter, cache);
+    if (!ok) failures.push(adapter.id);
+    if (!feed) continue; // nothing to write (failed with no prior feed)
+    anyChanged = anyChanged || changed;
+    await writeFile(`dist/${adapter.id}.json`, JSON.stringify(feed, null, 2));
+    manifest.push({
+      id: adapter.id, displayName: adapter.displayName, file: `${adapter.id}.json`,
+      version: feed.version, generatedAt: feed.generatedAt, month: feed.month,
+      count: (feed.movies ?? []).length, ok,
+    });
+    if (adapter.id === "united") unitedFeed = feed;
+  }
+
+  const index = { generatedAt: new Date().toISOString(), airlines: manifest };
+  await writeFile("dist/index.json", JSON.stringify(index, null, 2));
+
+  // Back-compat: the existing app fetches catalog.json — keep it mirroring United.
+  if (unitedFeed) await writeFile("dist/catalog.json", JSON.stringify(unitedFeed, null, 2));
+
+  console.log(`\nwrote ${manifest.length} feed(s); changed=${anyChanged}; failures=[${failures.join(", ")}]`);
   if (process.env.GITHUB_OUTPUT) {
-    await appendFile(process.env.GITHUB_OUTPUT, `changed=${changed}\n`);
+    await appendFile(process.env.GITHUB_OUTPUT, `changed=${anyChanged}\n`);
+  }
+  if (failures.length === adapters.length) {
+    throw new Error(`all sources failed: ${failures.join(", ")}`);
   }
 }
 
