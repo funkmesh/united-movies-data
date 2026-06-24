@@ -25,8 +25,10 @@ one enrichment pass and publishing step across all of them:
      Angular SPA) in headless Chromium and collects the `content/items` JSON it fetches
      for itself (movies + TV).
    - **American** (`sources/american.mjs`) — fetches `entertainment.aa.com/en/movies`
-     (a Next.js site, paginated `?page=N`) server-side and reads the movie records
-     embedded in each page's flight payload. Provides an IMDb id per title. Movies only.
+     and `/en/series` (a Next.js site, paginated `?page=N`) server-side and reads the
+     records embedded in each page's flight payload. Provides an IMDb id per title, and
+     tags each title with the IFE `systemIds` that carry it (the feed envelope publishes
+     a `systems` legend) — see Flight mode below.
    - **Delta** (`sources/delta.mjs`) — fetches the server-rendered "current movies" page
      and parses out title + poster. It's a curated subset of the onboard catalog with no
      other metadata, so the rest is backfilled from OMDb.
@@ -51,6 +53,31 @@ Create `sources/<id>.mjs` exporting `{ id, displayName, async harvest() }`, wher
 `harvest()` returns an array of titles in the common shape (see `mapItem` /
 `mapAmericanRecord` / `mapDeltaEntry` in `lib.mjs`). List it in `sources/index.mjs`.
 Geemedia-backed sites can reuse `harvestGeemedia` from `sources/_geemedia.mjs`.
+
+## Flight mode (American)
+
+American tags each title with the onboard IFE systems that carry it (`systemIds`), and
+`american.json` publishes a `systems` legend (each with `seatback`/`device` flags). Given
+a flight's aircraft capability you can filter the catalog to that flight.
+
+`flight-mode.mjs` is a prototype proxy that does this end to end:
+
+```sh
+npm run flight   # serves http://localhost:8787
+curl 'http://localhost:8787/flight?number=AA9&date=2026-06-25'
+#   -> { flight, systemIds, count, total, movies }  (streaming-only flight: 932/955 titles)
+```
+
+It resolves the flight via American's public schedule API
+(`GET entertainment.aa.com/api/flight?date=YYYY-MM-DD`), maps the flight's
+seatback/streaming capability to system ids (`flightSystemIds` in `lib.mjs`), and filters
+the feed (`filterCatalogForFlight`). It adds permissive CORS so a browser app can call it —
+American's own API sends none. The data functions are exported so the handler can be
+deployed as a serverless function instead.
+
+Caveats: American's public schedule returns only a subset of flights per day (some flight
+numbers won't resolve), filtering uses the seatback-vs-streaming model American's own site
+uses (not a precise per-tail system), and using AA's internal API has ToS implications.
 
 ## Run locally
 

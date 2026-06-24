@@ -4,6 +4,7 @@ import {
   mapItem, mapOMDb, parseAwards, mapWikidataAwards, prettyGenre,
   cleanTitle, parseYear, yearWithin, pickSearchMatch,
   extractAmericanRecords, mapAmericanRecord, americanSystems, americanSystemsLegend,
+  parseFlightNumber, flightCapabilities, flightSystemIds, filterCatalogForFlight,
   decodeEntities, extractDeltaEntries, mapDeltaEntry,
   omdbDescriptive, backfill, enrichKey, itemKey,
 } from "./lib.mjs";
@@ -213,6 +214,28 @@ test("mapAmericanRecord treats a season_number record as a series", () => {
   assert.equal(m.runtimeMinutes, null);
 });
 
+// A series record as /en/series publishes it: content_type "TV", no duration, id in
+// object_id (poster is the marker the extractor keys on).
+const AA_SERIES = {
+  name: "Angel City", content_type: "TV", object_id: "42afef1b", record_id: "recdknp",
+  duration: null, imdb_id: null, genres: ["Documentary"], director: "Arlene Nelson",
+  original_language: "English", synopsis: "A docuseries.", poster: "https://cdn.example/angel.jpg",
+};
+
+test("extractAmericanRecords also captures series (TV, no duration)", () => {
+  const recs = extractAmericanRecords(americanPage(AA_SERIES));
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].content_type, "TV");
+});
+
+test("mapAmericanRecord maps a series to kind=series with null runtime", () => {
+  const m = mapAmericanRecord(AA_SERIES);
+  assert.equal(m.kind, "series");
+  assert.equal(m.runtimeMinutes, null);
+  assert.equal(m.title, "Angel City");
+  assert.deepEqual(m.genres, ["Documentary"]);
+});
+
 // A record carrying the nested IFE-system structure American actually publishes.
 const AA_REC_SYS = {
   ...AA_REC,
@@ -254,6 +277,53 @@ test("americanSystemsLegend unions systems across records", () => {
   ]);
   assert.deepEqual(legend.map((s) => s.id), [5, 6, 24]);
   assert.equal(legend.find((s) => s.id === 6).oem, "Thales");
+});
+
+// --- American flight matching -----------------------------------------------
+
+const LEGEND = [
+  { id: 5, system: "Viasat W-IFE", name: "W-IFE", oem: "Viasat", seatback: false, device: true },
+  { id: 20, system: "Intelsat Gogo", name: "Gogo", oem: "Intelsat", seatback: false, device: true },
+  { id: 24, system: "PAC eX3", name: "eX3", oem: "PAC", seatback: true, device: false },
+  { id: 38, system: "Thales Titan", name: "Titan", oem: "Thales", seatback: true, device: false },
+];
+
+test("parseFlightNumber extracts the number from AA100 / 'aa 1' / '100'", () => {
+  assert.equal(parseFlightNumber("AA100"), 100);
+  assert.equal(parseFlightNumber("aa 1"), 1);
+  assert.equal(parseFlightNumber("100"), 100);
+  assert.equal(parseFlightNumber(""), null);
+  assert.equal(parseFlightNumber(null), null);
+});
+
+test("flightCapabilities reads seatback/streaming from the AA flag fields", () => {
+  assert.deepEqual(flightCapabilities({ seatback: "SB", wi_ent: "WE" }), { seatback: true, streaming: true });
+  assert.deepEqual(flightCapabilities({ seatback: null, wi_ent: "WE", wifi: "WF" }), { seatback: false, streaming: true });
+  assert.deepEqual(flightCapabilities({ seatback: "SB", wi_ent: null, wifi: null }), { seatback: true, streaming: false });
+});
+
+test("flightSystemIds resolves capabilities to system ids via the legend", () => {
+  assert.deepEqual(flightSystemIds({ seatback: null, wi_ent: "WE" }, LEGEND), [5, 20]);        // streaming-only
+  assert.deepEqual(flightSystemIds({ seatback: "SB", wi_ent: null, wifi: null }, LEGEND), [24, 38]); // seatback-only
+  assert.deepEqual(flightSystemIds({ seatback: "SB", wi_ent: "WE" }, LEGEND), [5, 20, 24, 38]); // both
+});
+
+test("filterCatalogForFlight keeps only titles available on the flight's systems", () => {
+  const movies = [
+    { title: "Seatback Only", systemIds: [24, 38] },
+    { title: "Streaming Only", systemIds: [5, 20] },
+    { title: "Everywhere", systemIds: [5, 24] },
+    { title: "Untagged", systemIds: [] },
+  ];
+  const streaming = filterCatalogForFlight(movies, LEGEND, { seatback: null, wi_ent: "WE" });
+  assert.deepEqual(streaming.systemIds, [5, 20]);
+  assert.deepEqual(streaming.movies.map((m) => m.title), ["Streaming Only", "Everywhere"]);
+
+  const seatback = filterCatalogForFlight(movies, LEGEND, { seatback: "SB", wi_ent: null, wifi: null });
+  assert.deepEqual(seatback.movies.map((m) => m.title), ["Seatback Only", "Everywhere"]);
+
+  const none = filterCatalogForFlight(movies, LEGEND, {}); // no capability -> all titles
+  assert.equal(none.movies.length, movies.length);
 });
 
 // --- Delta (delta.com current-movies HTML) ----------------------------------

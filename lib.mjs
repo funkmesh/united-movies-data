@@ -232,9 +232,10 @@ function decodeFlight(html) {
   return buf;
 }
 
-/** Extract American's movie record objects from a movies page. Balanced-brace scan
- * over the decoded flight buffer, keeping objects that JSON-parse and carry a
- * top-level name + object_id + duration (drops the page-sized wrappers around them). */
+/** Extract American's content records (films from /en/movies, series from /en/series)
+ * from a page's flight payload. Balanced-brace scan keeping objects that JSON-parse and
+ * carry a top-level name + poster + content_type — the marker of a real catalog record,
+ * which drops the page-sized wrappers and the nested episode/summary objects. */
 export function extractAmericanRecords(html) {
   const buf = decodeFlight(html);
   const out = new Map();
@@ -254,10 +255,11 @@ export function extractAmericanRecords(html) {
       const start = stack.pop();
       if (i + 1 - start > 50000) continue; // skip the page-sized wrappers, keep records
       const obj = buf.slice(start, i + 1);
-      if (!obj.includes('"object_id":"') || !obj.includes('"name":"')) continue;
+      if (!obj.includes('"name":"') || !obj.includes('"poster":"')) continue;
       let d;
       try { d = JSON.parse(obj); } catch { continue; }
-      if (typeof d.name === "string" && d.object_id && d.duration != null) out.set(d.object_id, d);
+      const id = d.object_id || d.record_id;
+      if (typeof d.name === "string" && id && nonEmpty(d.poster) && d.content_type) out.set(id, d);
     }
   }
   return [...out.values()];
@@ -329,6 +331,46 @@ export function mapAmericanRecord(rec) {
     imdbID: /^tt\d+$/.test(rec.imdb_id ?? "") ? rec.imdb_id : null,
     systemIds: americanSystems(rec).map((s) => s.id),
   };
+}
+
+// --- American flight matching (filter the catalog to a specific flight) -----
+
+/** Pull the integer flight number from user input like "AA100", "aa 100", "100". */
+export function parseFlightNumber(input) {
+  const digits = String(input ?? "").replace(/\D+/g, "");
+  return digits ? parseInt(digits, 10) : null;
+}
+
+/** An American flight record's IFE capabilities, from its seatback/wifi flags
+ * (seatback "SB"; wi_ent "WE" / wifi "WF" => streaming to your own device). */
+export function flightCapabilities(flight) {
+  return {
+    seatback: !!flight?.seatback,
+    streaming: !!(flight?.wi_ent || flight?.wifi),
+  };
+}
+
+/** The IFE system ids available on a flight: seatback systems if it has seatback screens,
+ * device systems if it streams — resolved against the feed's systems legend. Sorted. */
+export function flightSystemIds(flight, legend) {
+  const caps = flightCapabilities(flight);
+  const ids = new Set();
+  for (const s of legend ?? []) {
+    if (caps.seatback && s.seatback) ids.add(s.id);
+    if (caps.streaming && s.device) ids.add(s.id);
+  }
+  return [...ids].sort((a, b) => a - b);
+}
+
+/** Filter American titles to those available on a flight: titles whose systemIds intersect
+ * the flight's available systems. When the flight maps to no known system, returns all
+ * titles (graceful degrade). Returns { systemIds, movies }. */
+export function filterCatalogForFlight(movies, legend, flight) {
+  const ids = flightSystemIds(flight, legend);
+  if (ids.length === 0) return { systemIds: [], movies: movies ?? [] };
+  const set = new Set(ids);
+  const out = (movies ?? []).filter((m) => (m.systemIds ?? []).some((id) => set.has(id)));
+  return { systemIds: ids, movies: out };
 }
 
 // --- Delta (delta.com current-movies) HTML -> entries -----------------------

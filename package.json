@@ -6,6 +6,7 @@
   "description": "Builds enriched inflight catalog feeds for US airlines (United, American, Delta), published to GitHub Pages.",
   "scripts": {
     "build": "node build-catalog.mjs",
+    "flight": "node flight-mode.mjs",
     "test": "node --test"
   },
   "dependencies": {
