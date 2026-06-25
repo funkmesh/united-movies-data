@@ -38,6 +38,12 @@ one enrichment pass and publishing step across all of them:
      where the airline omits them — descriptive fields (genres, director, cast, synopsis,
      language, maturity, year, runtime). Source-provided fields are never overwritten.
    - **Wikidata** (matched by IMDb id) → named awards (`{ name, category, year }`).
+   - **Cross-airline identity** — after enrichment, every title gets a stable
+     `matchId`: its IMDb id (remake-safe — OMDb disambiguates by year), or, when a
+     title resolved no id of its own, the id another airline resolved for the same
+     title (only when unambiguous), or a year-independent title slug. The same film
+     therefore carries the same `matchId` on every airline, so the app can share a
+     user's watchlist/seen state for it across carriers.
 3. **Publish** — writes `dist/<id>.json` per airline as `{ id, displayName, version,
    generatedAt, month, movies }` (where `version` is a content hash excluding
    `generatedAt`), a `dist/index.json` manifest, and `dist/catalog.json` (United alias).

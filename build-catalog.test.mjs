@@ -7,7 +7,54 @@ import {
   parseFlightNumber, flightCapabilities, flightSystemIds, filterCatalogForFlight,
   decodeEntities, extractDeltaEntries, mapDeltaEntry,
   omdbDescriptive, backfill, enrichKey, itemKey, bareKey, indexPrevious, lookupPrevious,
+  slugify, slugKey, assignMatchIds,
 } from "./lib.mjs";
+
+test("slugify: year-independent, accent/punctuation-folded, article-stripped", () => {
+  assert.equal(slugify("The Batman (2022)"), "batman");
+  assert.equal(slugify("Amélie"), "amelie");
+  assert.equal(slugify("Matrix, The"), "matrix");
+  assert.equal(slugify("Spider-Man: No Way Home"), "spider-man-no-way-home");
+});
+
+test("assignMatchIds: own IMDb id wins; series keep the season", () => {
+  const ms = [
+    { kind: "movie", title: "Inception", year: 2010, imdbID: "tt1375666" },
+    { kind: "series", title: "The Bear", seasonNumber: 3, imdbID: "tt14452776" },
+  ];
+  assignMatchIds(ms);
+  assert.equal(ms[0].matchId, "tt1375666");
+  assert.equal(ms[1].matchId, "tt14452776-s3");
+});
+
+test("assignMatchIds: a title with no IMDb id inherits a sibling airline's id", () => {
+  const ms = [
+    { kind: "movie", title: "Coco", year: 2017, imdbID: "tt2380307" }, // American
+    { kind: "movie", title: "Coco", year: null, imdbID: null },        // Delta
+  ];
+  assignMatchIds(ms);
+  assert.equal(ms[0].matchId, "tt2380307");
+  assert.equal(ms[1].matchId, "tt2380307"); // shared across airlines
+});
+
+test("assignMatchIds: ambiguous remakes don't cross-contaminate; slug fallback", () => {
+  const ms = [
+    { kind: "movie", title: "Dune", year: 1984, imdbID: "tt0087182" },
+    { kind: "movie", title: "Dune", year: 2021, imdbID: "tt1160419" },
+    { kind: "movie", title: "Dune", year: null, imdbID: null }, // can't tell which
+  ];
+  assignMatchIds(ms);
+  assert.equal(ms[0].matchId, "tt0087182"); // distinct
+  assert.equal(ms[1].matchId, "tt1160419"); // distinct
+  assert.equal(ms[2].matchId, "dune");      // not wrongly tied to a remake
+});
+
+test("assignMatchIds: pool lets reused feeds lend ids without being reassigned", () => {
+  const rebuilt = [{ kind: "movie", title: "Milk", year: null, imdbID: null }];
+  const pool = [...rebuilt, { kind: "movie", title: "Milk", year: 2008, imdbID: "tt1013753" }];
+  assignMatchIds(rebuilt, pool);
+  assert.equal(rebuilt[0].matchId, "tt1013753");
+});
 
 test("cleanTitle strips a trailing (YYYY)", () => {
   assert.equal(cleanTitle("The Running Man (2025)"), "The Running Man");

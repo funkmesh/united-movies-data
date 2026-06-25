@@ -26,6 +26,7 @@ import { writeFile, mkdir, appendFile } from "node:fs/promises";
 import {
   mapOMDb, mapWikidataAwards, enrichKey, cleanTitle, yearWithin,
   pickSearchMatch, omdbDescriptive, backfill, indexPrevious, lookupPrevious,
+  assignMatchIds,
 } from "./lib.mjs";
 import SOURCES from "./sources/index.mjs";
 
@@ -199,10 +200,11 @@ function stableStringify(value) {
   );
 }
 
-/** Build one airline's feed. On harvest failure, returns the previously-published feed
- * (so a transient failure doesn't wipe data); returns null only if there's nothing to
- * fall back on. The boolean `changed` is whether this airline's content changed. */
-async function buildAirline(adapter, cache) {
+/** Phase 1: harvest + enrich one airline, returning the enriched titles *without*
+ * hashing them yet — so a cross-airline `matchId` pass can run before feeds are
+ * versioned and written. On harvest failure, carries the previously-published feed
+ * to reuse (so a transient failure doesn't wipe data). */
+async function harvestAirline(adapter, cache) {
   const { id, displayName } = adapter;
   console.log(`\n=== ${displayName} (${id}) ===`);
   const previous = await loadPrevious(id);
@@ -218,22 +220,29 @@ async function buildAirline(adapter, cache) {
     console.log(`  harvested ${movies.length} items (${movieCount} movies, ${movies.length - movieCount} series)`);
 
     await enrich(movies, previous, cache);
-
-    const version = createHash("sha256").update(stableStringify({ ...envelope, movies })).digest("hex").slice(0, 16);
-    const changed = !previous || previous.version !== version;
-    const generatedAt = changed ? new Date().toISOString() : (previous?.generatedAt ?? new Date().toISOString());
-    const month = new Date().toLocaleString("en-US", { month: "long", year: "numeric" });
-    console.log(`  version ${version}, changed=${changed}, ${movies.length} titles`);
-    return { feed: { id, displayName, version, generatedAt, month, ...envelope, movies }, changed, ok: true };
+    return { id, displayName, envelope, movies, previous, ok: true };
   } catch (err) {
     console.error(`  ✗ ${id} failed: ${err.message}`);
     if (previous?.raw) {
       console.log(`  reusing previously-published ${id}.json (${(previous.raw.movies ?? []).length} titles)`);
-      return { feed: previous.raw, changed: false, ok: false };
+    } else {
+      console.log(`  no previous ${id} feed to fall back on — skipping`);
     }
-    console.log(`  no previous ${id} feed to fall back on — skipping`);
-    return { feed: null, changed: false, ok: false };
+    return { id, displayName, previous, ok: false, reuse: previous?.raw ?? null };
   }
+}
+
+/** Phase 2: hash + assemble one airline's feed, after `matchId`s are assigned. A
+ * failed airline reuses its previously-published feed (no version change). */
+function finalizeAirline(built) {
+  const { id, displayName, envelope, movies, previous, ok, reuse } = built;
+  if (!ok) return { feed: reuse, changed: false, ok: false };
+  const version = createHash("sha256").update(stableStringify({ ...envelope, movies })).digest("hex").slice(0, 16);
+  const changed = !previous || previous.version !== version;
+  const generatedAt = changed ? new Date().toISOString() : (previous?.generatedAt ?? new Date().toISOString());
+  const month = new Date().toLocaleString("en-US", { month: "long", year: "numeric" });
+  console.log(`  ${id}: version ${version}, changed=${changed}, ${movies.length} titles`);
+  return { feed: { id, displayName, version, generatedAt, month, ...envelope, movies }, changed, ok: true };
 }
 
 async function main() {
@@ -243,23 +252,38 @@ async function main() {
 
   await mkdir("dist", { recursive: true });
   const cache = new Map();
+
+  // Phase 1: harvest + enrich every airline.
+  const built = [];
+  for (const adapter of adapters) built.push(await harvestAirline(adapter, cache));
+
+  // Cross-airline identity: assign a stable matchId to the airlines we rebuilt,
+  // using every airline's resolved IMDb ids (including reused feeds) as the pool —
+  // so a title one airline matched lends its id to another that couldn't.
+  const rebuilt = built.filter((b) => b.ok).flatMap((b) => b.movies);
+  const pool = [
+    ...rebuilt,
+    ...built.filter((b) => !b.ok && b.reuse).flatMap((b) => b.reuse.movies ?? []),
+  ];
+  assignMatchIds(rebuilt, pool);
+
+  // Phase 2: hash + write each feed.
   const manifest = [];
   const failures = [];
   let anyChanged = false;
   let unitedFeed = null;
-
-  for (const adapter of adapters) {
-    const { feed, changed, ok } = await buildAirline(adapter, cache);
-    if (!ok) failures.push(adapter.id);
+  for (const b of built) {
+    const { feed, changed, ok } = finalizeAirline(b);
+    if (!ok) failures.push(b.id);
     if (!feed) continue; // nothing to write (failed with no prior feed)
     anyChanged = anyChanged || changed;
-    await writeFile(`dist/${adapter.id}.json`, JSON.stringify(feed, null, 2));
+    await writeFile(`dist/${b.id}.json`, JSON.stringify(feed, null, 2));
     manifest.push({
-      id: adapter.id, displayName: adapter.displayName, file: `${adapter.id}.json`,
+      id: b.id, displayName: b.displayName, file: `${b.id}.json`,
       version: feed.version, generatedAt: feed.generatedAt, month: feed.month,
       count: (feed.movies ?? []).length, ok,
     });
-    if (adapter.id === "united") unitedFeed = feed;
+    if (b.id === "united") unitedFeed = feed;
   }
 
   const index = { generatedAt: new Date().toISOString(), airlines: manifest };
