@@ -504,3 +504,59 @@ export function lookupPrevious(idx, movie) {
     idx.byKey.get(itemKey(movie)) ||
     idx.byBare.get(bareKey(movie));
 }
+
+// --- cross-airline identity (matchId) ---------------------------------------
+
+/** Year-independent, accent/punctuation-folded title slug. Mirrors the app's
+ * TitleMatcher.canonical so the same film slugs identically across airlines and
+ * matches the app's fallback for feeds published before matchId existed. */
+export function slugify(title) {
+  let t = String(title ?? "").toLowerCase();
+  t = t.normalize("NFKD").replace(/[̀-ͯ]/g, ""); // fold diacritics
+  t = t.replace(/\([^)]*\)/g, " ").replace(/\[[^\]]*\]/g, " ");
+  const comma = t.indexOf(", ");
+  if (comma !== -1) {
+    const head = t.slice(0, comma);
+    const tail = t.slice(comma + 2).trim();
+    if (["the", "a", "an"].includes(tail)) t = `${tail} ${head}`;
+  }
+  t = t.replace(/[^a-z0-9]+/g, " ").trim();
+  let toks = t.split(/\s+/).filter(Boolean);
+  if (toks.length && ["the", "a", "an"].includes(toks[0])) toks = toks.slice(1);
+  return toks.join("-");
+}
+
+/** Title-only key for cross-airline identity (kind + slug + season), so the same
+ * film unifies across airlines despite title-formatting or year-presence differences. */
+export function slugKey(m) {
+  return `${m.kind ?? "movie"}|${slugify(m.title)}|${m.seasonNumber ?? ""}`;
+}
+
+/** Assign a stable cross-airline `matchId` to each movie so the app can share
+ * watch state (seen / watchlist / …) for the same film across airlines:
+ *   1. its own IMDb id (remake-safe — OMDb disambiguates by year), else
+ *   2. the IMDb id another airline resolved for the same title — but only when
+ *      that title maps to exactly one IMDb id (ambiguous remakes fall through), else
+ *   3. a year-independent title slug.
+ * Series append the season so seasons stay distinct. Builds the IMDb map from
+ * `pool` (default: the movies themselves) and mutates+returns `movies`. */
+export function assignMatchIds(movies, pool = movies) {
+  const imdbByTitle = new Map();
+  for (const m of pool) {
+    if (!m.imdbID) continue;
+    const k = slugKey(m);
+    (imdbByTitle.get(k) ?? imdbByTitle.set(k, new Set()).get(k)).add(m.imdbID);
+  }
+  for (const m of movies) {
+    let imdb = m.imdbID;
+    if (!imdb) {
+      const cands = imdbByTitle.get(slugKey(m));
+      if (cands && cands.size === 1) imdb = [...cands][0];
+    }
+    const base = imdb || slugify(m.title);
+    m.matchId = m.kind === "series" && m.seasonNumber != null
+      ? `${base}-s${m.seasonNumber}`
+      : base;
+  }
+  return movies;
+}
