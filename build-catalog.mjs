@@ -24,8 +24,8 @@
 import { createHash } from "node:crypto";
 import { writeFile, mkdir, appendFile } from "node:fs/promises";
 import {
-  mapOMDb, mapWikidataAwards, itemKey, enrichKey, cleanTitle, yearWithin,
-  pickSearchMatch, omdbDescriptive, backfill,
+  mapOMDb, mapWikidataAwards, enrichKey, cleanTitle, yearWithin,
+  pickSearchMatch, omdbDescriptive, backfill, indexPrevious, lookupPrevious,
 } from "./lib.mjs";
 import SOURCES from "./sources/index.mjs";
 
@@ -40,10 +40,9 @@ async function loadPrevious(id) {
     const resp = await fetch(`${PAGES_BASE}/${id}.json`, { headers: { "User-Agent": WIKIDATA_UA } });
     if (!resp.ok) return null;
     const json = await resp.json();
-    const movies = new Map();
-    for (const m of json.movies ?? []) movies.set(itemKey(m), m);
-    console.log(`  loaded ${movies.size} previously-published ${id} titles for reuse`);
-    return { version: json.version, generatedAt: json.generatedAt, movies, raw: json };
+    const index = indexPrevious(json.movies ?? []);
+    console.log(`  loaded ${(json.movies ?? []).length} previously-published ${id} titles for reuse`);
+    return { version: json.version, generatedAt: json.generatedAt, index, raw: json };
   } catch {
     console.log(`  no previous ${id} feed (first run or unreachable)`);
     return null;
@@ -151,7 +150,7 @@ function applyEnrichment(movie, enr) {
 async function enrich(movies, previous, cache) {
   let fetched = 0, cacheHits = 0, reused = 0;
   for (const movie of movies) {
-    const prior = previous?.movies.get(itemKey(movie));
+    const prior = lookupPrevious(previous?.index, movie);
     if (prior && prior.imdbRating != null) {
       // Reuse only titles we already have a rating for; everything else (never matched,
       // or matched but unrated) is retried each run so improved matching and newly-added

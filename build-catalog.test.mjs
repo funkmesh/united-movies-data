@@ -6,7 +6,7 @@ import {
   extractAmericanRecords, mapAmericanRecord, americanSystems, americanSystemsLegend,
   parseFlightNumber, flightCapabilities, flightSystemIds, filterCatalogForFlight,
   decodeEntities, extractDeltaEntries, mapDeltaEntry,
-  omdbDescriptive, backfill, enrichKey, itemKey,
+  omdbDescriptive, backfill, enrichKey, itemKey, bareKey, indexPrevious, lookupPrevious,
 } from "./lib.mjs";
 
 test("cleanTitle strips a trailing (YYYY)", () => {
@@ -410,6 +410,31 @@ test("enrichKey prefers a source IMDb id, else the per-title key", () => {
   assert.equal(enrichKey(mapAmericanRecord(AA_REC)), "i:tt1757678");
   const delta = mapDeltaEntry({ title: "Coco", posterURL: "p" });
   assert.equal(enrichKey(delta), itemKey(delta));
+});
+
+test("bareKey ignores year but keeps kind/title/season", () => {
+  assert.equal(bareKey({ kind: "movie", title: "Coco", year: 2017, seasonNumber: null }), "movie|coco|");
+  assert.equal(bareKey({ kind: "movie", title: "Coco", year: null, seasonNumber: null }), "movie|coco|");
+  assert.equal(bareKey({ kind: "series", title: "Show", seasonNumber: 2 }), "series|show|2");
+});
+
+test("lookupPrevious reuses a title whose year was backfilled between runs", () => {
+  // Prior feed: enriched last run, so year was backfilled from OMDb.
+  const prior = [
+    { kind: "movie", title: "A Single Man", year: 2009, imdbID: "tt1315981", imdbRating: 7.5, seasonNumber: null },
+    { kind: "movie", title: "Superman", year: 1978, imdbID: "tt0078346", imdbRating: 7.4, seasonNumber: null },
+    { kind: "movie", title: "Superman", year: 2025, imdbID: "tt5950044", imdbRating: 7.0, seasonNumber: null },
+  ];
+  const idx = indexPrevious(prior);
+  // Delta harvests with year=null and no imdbID -> matched via the bare (year-less) key.
+  assert.equal(lookupPrevious(idx, { kind: "movie", title: "A Single Man", year: null, seasonNumber: null })?.imdbID, "tt1315981");
+  // American harvests with a source imdbID -> disambiguates same-title remakes.
+  assert.equal(lookupPrevious(idx, { kind: "movie", title: "Superman", year: null, imdbID: "tt5950044", seasonNumber: null })?.year, 2025);
+  assert.equal(lookupPrevious(idx, { kind: "movie", title: "Superman", year: null, imdbID: "tt0078346", seasonNumber: null })?.year, 1978);
+  // United harvests with a stable source year -> exact key still works.
+  assert.equal(lookupPrevious(idx, { kind: "movie", title: "A Single Man", year: 2009, seasonNumber: null })?.imdbID, "tt1315981");
+  // Miss returns undefined.
+  assert.equal(lookupPrevious(idx, { kind: "movie", title: "Nope", year: null, seasonNumber: null }), undefined);
 });
 
 test("mapWikidataAwards splits 'X for Y' labels and dedupes", () => {

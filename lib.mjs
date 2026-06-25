@@ -475,3 +475,32 @@ export function itemKey(m) {
 export function enrichKey(m) {
   return m.imdbID ? `i:${m.imdbID}` : itemKey(m);
 }
+
+/** A year-independent fallback key (kind + title + season). `itemKey` includes the year,
+ * but sources like American/Delta harvest with year=null and only get a year backfilled
+ * from OMDb — so the published feed's `itemKey` won't match the next run's harvested one.
+ * Matching on this bare key (and on IMDb id) keeps prior-feed reuse working for them. */
+export function bareKey(m) {
+  return `${m.kind ?? "movie"}|${m.title.toLowerCase().trim()}|${m.seasonNumber ?? ""}`;
+}
+
+/** Index a previously-published feed's titles for reuse, by exact key, bare key, and
+ * IMDb id (so reuse survives a year being backfilled between runs). */
+export function indexPrevious(movies) {
+  const byKey = new Map(), byBare = new Map(), byImdb = new Map();
+  for (const m of movies ?? []) {
+    byKey.set(itemKey(m), m);
+    if (!byBare.has(bareKey(m))) byBare.set(bareKey(m), m);
+    if (m.imdbID) byImdb.set(m.imdbID, m);
+  }
+  return { byKey, byBare, byImdb };
+}
+
+/** Find a harvested title in the prior-feed index: by source IMDb id (most precise,
+ * disambiguates same-title remakes), then exact key, then the year-independent key. */
+export function lookupPrevious(idx, movie) {
+  if (!idx) return undefined;
+  return (movie.imdbID && idx.byImdb.get(movie.imdbID)) ||
+    idx.byKey.get(itemKey(movie)) ||
+    idx.byBare.get(bareKey(movie));
+}
