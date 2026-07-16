@@ -14,6 +14,7 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  issues: write # open a tracking issue when a catalog's size looks anomalous
 
 concurrency:
   group: pages
@@ -42,6 +43,46 @@ jobs:
         env:
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
         run: npm run build
+
+      - name: Report catalog size anomalies
+        if: steps.build.outputs.has_anomalies == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const anomalies = JSON.parse(fs.readFileSync('dist/anomalies.json', 'utf8'));
+            if (!anomalies.length) return;
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const rows = anomalies
+              .map((a) => `| ${a.displayName} | ${a.count} | ${a.previousCount ?? '—'} | ${a.expectedMin} | ${a.severity} | ${a.reason} |`)
+              .join('\n');
+            const body = [
+              'A scheduled catalog build harvested an airline whose size looks off. This is usually',
+              'the source page changing shape or a parser no longer matching (see united-movies#21).',
+              '',
+              '| Airline | Harvested | Previous | Min expected | Severity | Detail |',
+              '| --- | --- | --- | --- | --- | --- |',
+              rows,
+              '',
+              `Build run: ${run}`,
+            ].join('\n');
+            const title = 'Catalog size anomaly detected';
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', creator: 'github-actions[bot]', per_page: 100,
+            });
+            const open = existing.data.find((i) => i.title === title && !i.pull_request);
+            if (open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: open.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body,
+              });
+            }
 
       - name: Upload Pages artifact
         if: steps.build.outputs.changed == 'true'

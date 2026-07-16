@@ -8,6 +8,7 @@ import {
   decodeEntities, extractDeltaEntries, mapDeltaEntry,
   omdbDescriptive, backfill, enrichKey, itemKey, bareKey, indexPrevious, lookupPrevious,
   slugify, slugKey, assignMatchIds,
+  evaluateCatalogSize, checkCatalogSizes, CATALOG_EXPECTATIONS,
 } from "./lib.mjs";
 
 test("slugify: year-independent, accent/punctuation-folded, article-stripped", () => {
@@ -394,6 +395,41 @@ test("extractDeltaEntries pulls deduped title + absolute poster", () => {
   assert.equal(entries[1].title, "Copa '71");
 });
 
+test("extractDeltaEntries is attribute-order-agnostic (title before src)", () => {
+  // Most of Delta's grid renders title="" ahead of the poster attribute; the old
+  // src-then-title regex missed all of it (united-movies#21).
+  const html = `
+    <img title="Dune" class="poster" src="/content/dam/delta-com/products/movie-thumbs/june-2026/dune-180x250.jpg" alt="Dune"/>
+    <img alt="Wicked" title="Wicked" src="/content/dam/delta-com/products/movie-thumbs/june-2026/wicked-180x250.jpg"/>`;
+  const entries = extractDeltaEntries(html);
+  assert.equal(entries.length, 2);
+  assert.deepEqual(entries.map((e) => e.title).sort(), ["Dune", "Wicked"]);
+  assert.equal(entries[0].posterURL, "https://www.delta.com/content/dam/delta-com/products/movie-thumbs/june-2026/dune-180x250.jpg");
+});
+
+test("extractDeltaEntries reads lazy-loaded posters from data-src", () => {
+  // Lazy-loaded posters keep a placeholder in src and the real thumb in data-src.
+  const html = `
+    <img src="/content/dam/delta-com/loading-placeholder.gif" data-src="/content/dam/delta-com/products/movie-thumbs/june-2026/oppenheimer-180x250.jpg" title="Oppenheimer" alt="Oppenheimer"/>`;
+  const entries = extractDeltaEntries(html);
+  assert.equal(entries.length, 1);
+  assert.deepEqual(entries[0], {
+    title: "Oppenheimer",
+    posterURL: "https://www.delta.com/content/dam/delta-com/products/movie-thumbs/june-2026/oppenheimer-180x250.jpg",
+  });
+});
+
+test("extractDeltaEntries skips thumbs images that carry no title", () => {
+  const html = `
+    <img src="/content/dam/delta-com/products/movie-thumbs/june-2026/mystery-180x250.jpg" alt="no title attr"/>
+    <img data-src="/content/dam/delta-com/products/movie-thumbs/june-2026/barbie-180x250.jpg" title="Barbie"/>`;
+  const entries = extractDeltaEntries(html);
+  assert.deepEqual(entries, [{
+    title: "Barbie",
+    posterURL: "https://www.delta.com/content/dam/delta-com/products/movie-thumbs/june-2026/barbie-180x250.jpg",
+  }]);
+});
+
 test("mapDeltaEntry leaves everything but title/poster null for OMDb backfill", () => {
   const m = mapDeltaEntry({ title: "Coco", posterURL: "https://x/coco.jpg" });
   assert.equal(m.kind, "movie");
@@ -499,4 +535,60 @@ test("mapWikidataAwards splits 'X for Y' labels and dedupes", () => {
     { name: "Academy Award", category: "Best Picture", year: 2001 }
   );
   assert.deepEqual(awards.find((a) => a.name === "Saturn Award"), { name: "Saturn Award", category: null, year: null });
+});
+
+// --- Catalog-size sanity checks ---------------------------------------------
+
+test("evaluateCatalogSize: healthy size returns null", () => {
+  assert.equal(evaluateCatalogSize("delta", 220, 210), null);
+  assert.equal(evaluateCatalogSize("delta", 300, null), null, "no previous -> floor only");
+});
+
+test("evaluateCatalogSize: below the floor is an error anomaly", () => {
+  // The united-movies#21 regression: Delta harvested only 26 of hundreds of titles.
+  const a = evaluateCatalogSize("delta", 26, 210);
+  assert.equal(a.severity, "error");
+  assert.equal(a.id, "delta");
+  assert.equal(a.count, 26);
+  assert.equal(a.previousCount, 210);
+  assert.equal(a.expectedMin, CATALOG_EXPECTATIONS.delta.min);
+  assert.match(a.reason, /below the expected minimum/);
+});
+
+test("evaluateCatalogSize: a big drop above the floor is a warning", () => {
+  const a = evaluateCatalogSize("american", 400, 955);
+  assert.equal(a.severity, "warning");
+  assert.match(a.reason, /down 58% from the last published 955/);
+});
+
+test("evaluateCatalogSize: a large surge above the floor is a warning", () => {
+  const a = evaluateCatalogSize("delta", 900, 210);
+  assert.equal(a.severity, "warning");
+  assert.match(a.reason, /over-matching/);
+});
+
+test("evaluateCatalogSize: a moderate change is fine", () => {
+  assert.equal(evaluateCatalogSize("american", 900, 955), null);
+  assert.equal(evaluateCatalogSize("delta", 210, 300), null, "30% drop is within tolerance");
+});
+
+test("evaluateCatalogSize: ignores a zero/absent previous for the relative check", () => {
+  assert.equal(evaluateCatalogSize("american", 950, 0), null);
+  assert.equal(evaluateCatalogSize("american", 950, null), null);
+});
+
+test("evaluateCatalogSize: thresholds are overridable", () => {
+  assert.equal(evaluateCatalogSize("delta", 5, 10, { min: 5 }), null, "custom floor lets 5 pass");
+  const a = evaluateCatalogSize("delta", 60, 100, { min: 5, shrink: 0.7 });
+  assert.equal(a.severity, "warning", "stricter shrink threshold trips on a 40% drop");
+});
+
+test("checkCatalogSizes: reports only the anomalous airlines", () => {
+  const anomalies = checkCatalogSizes([
+    { id: "united", count: 40, previousCount: 42 },   // healthy
+    { id: "delta", count: 26, previousCount: 210 },   // broken
+    { id: "american", count: 950, previousCount: 955 }, // healthy
+  ]);
+  assert.equal(anomalies.length, 1);
+  assert.equal(anomalies[0].id, "delta");
 });

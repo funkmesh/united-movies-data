@@ -390,13 +390,27 @@ export function decodeEntities(s) {
 
 /** Parse Delta's current-movies page into [{title, posterURL}]. Delta exposes only a
  * title + poster per entry (the rest is backfilled from OMDb), and renders each twice
- * for responsive layout, so we dedupe by title. */
+ * for responsive layout, so we dedupe by title.
+ *
+ * We match each <img> tag as a whole, then pull the poster and title attributes out of
+ * it independently. A single ordered regex (src="..." then title="...") missed most of
+ * the catalog: Delta's grid varies the attribute order and lazy-loads posters via
+ * `data-src` (leaving `src` a placeholder), so only the handful of eagerly-loaded
+ * "new on Delta" posters matched — see united-movies#21. Matching the tag and probing
+ * for `data-src`/`src` + `title` in any order is order-agnostic and lazy-load aware. */
 export function extractDeltaEntries(html, base = "https://www.delta.com") {
   const seen = new Map();
-  const re = /<img\s+src="(\/content\/dam\/delta-com\/products\/[^"]*thumbs[^"]+)"\s+title="([^"]+)"/g;
-  for (const m of String(html).matchAll(re)) {
-    const title = decodeEntities(m[2]).trim();
-    if (title && !seen.has(title)) seen.set(title, base + m[1]);
+  const imgTagRe = /<img\b([^>]+)>/gi;
+  const srcRe = /\b(?:data-src|src)="(\/content\/dam\/delta-com\/products\/[^"]*thumbs[^"]+)"/i;
+  const titleRe = /\btitle="([^"]+)"/i;
+  for (const tagMatch of String(html).matchAll(imgTagRe)) {
+    const attrs = tagMatch[1];
+    const srcMatch = srcRe.exec(attrs);
+    if (!srcMatch) continue;
+    const titleMatch = titleRe.exec(attrs);
+    if (!titleMatch) continue;
+    const title = decodeEntities(titleMatch[1]).trim();
+    if (title && !seen.has(title)) seen.set(title, base + srcMatch[1]);
   }
   return [...seen.entries()].map(([title, posterURL]) => ({ title, posterURL }));
 }
@@ -559,4 +573,77 @@ export function assignMatchIds(movies, pool = movies) {
       : base;
   }
   return movies;
+}
+
+// --- Catalog-size sanity checks ---------------------------------------------
+//
+// A harvest can silently return far fewer titles than it should — a page's markup
+// changes, a parser stops matching, a paginated source loses its later pages — while
+// still returning enough to clear the "> 0 items" bar. Delta shipped 26 of ~hundreds
+// of titles that way (united-movies#21). These checks compare each airline's fresh
+// harvest against a floor and against its own last published size, so a collapse (or an
+// implausible surge, which usually means a parser is now over-matching) is flagged
+// rather than quietly published.
+
+/** Per-airline expectations for the size sanity check. `min` is a conservative floor —
+ * a healthy harvest is comfortably above it, so tripping it means something broke, not
+ * that the catalog merely churned. Tune these as real catalog sizes drift. */
+export const CATALOG_EXPECTATIONS = {
+  united: { min: 20 },
+  american: { min: 300 },
+  delta: { min: 50 },
+};
+
+/** Default relative-change thresholds vs. the previously published size. */
+export const CATALOG_CHANGE_THRESHOLDS = { shrink: 0.5, grow: 4 };
+
+/** Evaluate one airline's harvested `count` against its floor and its previous size.
+ * Returns null when the size looks healthy, or an anomaly describing what's off:
+ *   { id, count, previousCount, expectedMin, severity, reason }
+ * `severity` is "error" for a below-floor collapse (feed is almost certainly broken)
+ * and "warning" for a large relative shift (worth a look, not necessarily broken).
+ * A missing/unknown `previousCount` (first run) skips the relative comparison. */
+export function evaluateCatalogSize(id, count, previousCount, opts = {}) {
+  const expectedMin = opts.min ?? CATALOG_EXPECTATIONS[id]?.min ?? 1;
+  const shrink = opts.shrink ?? CATALOG_CHANGE_THRESHOLDS.shrink;
+  const grow = opts.grow ?? CATALOG_CHANGE_THRESHOLDS.grow;
+  const prev = Number.isFinite(previousCount) && previousCount > 0 ? previousCount : null;
+  const base = { id, count, previousCount: prev, expectedMin };
+
+  if (count < expectedMin) {
+    return {
+      ...base,
+      severity: "error",
+      reason: `harvested ${count} titles, below the expected minimum of ${expectedMin}`
+        + (prev != null ? ` (last published ${prev})` : "")
+        + " — the source page or its parser has likely changed",
+    };
+  }
+  if (prev != null && count < prev * shrink) {
+    const pct = Math.round((1 - count / prev) * 100);
+    return {
+      ...base,
+      severity: "warning",
+      reason: `harvested ${count} titles, down ${pct}% from the last published ${prev}`
+        + " — the source may have changed or the parser may be missing entries",
+    };
+  }
+  if (prev != null && count > prev * grow) {
+    const factor = (count / prev).toFixed(1);
+    return {
+      ...base,
+      severity: "warning",
+      reason: `harvested ${count} titles, ${factor}× the last published ${prev}`
+        + " — a large jump can mean the parser is now over-matching (verify the results)",
+    };
+  }
+  return null;
+}
+
+/** Run {@link evaluateCatalogSize} across every successfully-harvested airline.
+ * `reports` is an array of { id, count, previousCount }. Returns the anomalies. */
+export function checkCatalogSizes(reports, opts = {}) {
+  return reports
+    .map((r) => evaluateCatalogSize(r.id, r.count, r.previousCount, opts[r.id]))
+    .filter(Boolean);
 }
