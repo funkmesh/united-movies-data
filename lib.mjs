@@ -388,20 +388,21 @@ export function decodeEntities(s) {
   });
 }
 
-/** Parse Delta's current-movies page into [{title, posterURL}]. Delta exposes only a
- * title + poster per entry (the rest is backfilled from OMDb), and renders each twice
- * for responsive layout, so we dedupe by title.
+/** Parse one of Delta's entertainment pages into [{title, posterURL}]. Delta exposes
+ * only a title + poster per entry (the rest is backfilled from OMDb), and renders each
+ * twice for responsive layout, so we dedupe by title.
  *
  * We match each <img> tag as a whole, then pull the poster and title attributes out of
- * it independently. A single ordered regex (src="..." then title="...") missed most of
- * the catalog: Delta's grid varies the attribute order and lazy-loads posters via
- * `data-src` (leaving `src` a placeholder), so only the handful of eagerly-loaded
- * "new on Delta" posters matched — see united-movies#21. Matching the tag and probing
- * for `data-src`/`src` + `title` in any order is order-agnostic and lazy-load aware. */
+ * it independently — robust to attribute reordering and lazy-load (`data-src`) markup
+ * variants across Delta's pages. Poster paths are usually root-relative, but a few
+ * entries (e.g. on the TV page) carry an absolute `https://www.delta.com/...` src, so
+ * the origin is optional in the match and the output is normalized onto `base`. The
+ * `…/delta-com/products/…thumbs…` path constraint filters out non-poster images
+ * (logos, placeholders). */
 export function extractDeltaEntries(html, base = "https://www.delta.com") {
   const seen = new Map();
   const imgTagRe = /<img\b([^>]+)>/gi;
-  const srcRe = /\b(?:data-src|src)="(\/content\/dam\/delta-com\/products\/[^"]*thumbs[^"]+)"/i;
+  const srcRe = /\b(?:data-src|src)="(?:https?:\/\/[^"/]*delta\.com)?(\/content\/dam\/delta-com\/products\/[^"]*thumbs[^"]+)"/i;
   const titleRe = /\btitle="([^"]+)"/i;
   for (const tagMatch of String(html).matchAll(imgTagRe)) {
     const attrs = tagMatch[1];
@@ -416,12 +417,17 @@ export function extractDeltaEntries(html, base = "https://www.delta.com") {
 }
 
 /** Map a Delta entry to the app's catalog shape (everything but title/poster is null,
- * to be backfilled from OMDb). */
-export function mapDeltaEntry(entry) {
+ * to be backfilled from OMDb). `kind` is "movie", "series", or "unknown" — Delta's
+ * kids page mixes both, so its titles are emitted as "unknown": keyed as a movie (so
+ * enrichment-reuse keys stay harvest-stable) but flagged `kindUncertain`, which makes
+ * the OMDb lookup type-agnostic and lets the resolved record's type set the real kind. */
+export function mapDeltaEntry(entry, kind = "movie") {
   const title = (entry?.title ?? "").trim();
   if (!title) return null;
+  const uncertain = kind === "unknown";
   return {
-    kind: "movie",
+    kind: uncertain ? "movie" : kind,
+    ...(uncertain ? { kindUncertain: true } : {}),
     title,
     year: null,
     runtimeMinutes: null,
@@ -437,6 +443,27 @@ export function mapDeltaEntry(entry) {
   };
 }
 
+/** Merge the per-page harvests of Delta's entertainment pages into one item list.
+ * `pages` is [{ kind, entries }] in priority order: when the same title appears on
+ * several pages (the kids page repeats titles from the movies and TV pages), the
+ * earliest page wins — so a title listed on a kind-certain page never reaches the
+ * kids page's "unknown" classification. */
+export function mergeDeltaPages(pages) {
+  const seen = new Set();
+  const items = [];
+  for (const { kind, entries } of pages) {
+    for (const entry of entries) {
+      const mapped = mapDeltaEntry(entry, kind);
+      if (!mapped) continue;
+      const key = mapped.title.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(mapped);
+    }
+  }
+  return items;
+}
+
 // --- OMDb descriptive backfill (for sources that omit metadata) -------------
 
 function firstLanguage(v) {
@@ -449,6 +476,7 @@ export function omdbDescriptive(j) {
   if (!j || j.Response === "False") return {};
   const rt = /(\d+)\s*min/i.exec(j.Runtime ?? "");
   return {
+    kind: j.Type === "series" ? "series" : j.Type === "movie" ? "movie" : null,
     year: parseYear(j.Year),
     runtimeMinutes: rt ? parseInt(rt[1], 10) : null,
     genres: nameList(j.Genre === "N/A" ? "" : j.Genre).map(prettyGenre),
@@ -516,7 +544,11 @@ export function lookupPrevious(idx, movie) {
   if (!idx) return undefined;
   return (movie.imdbID && idx.byImdb.get(movie.imdbID)) ||
     idx.byKey.get(itemKey(movie)) ||
-    idx.byBare.get(bareKey(movie));
+    idx.byBare.get(bareKey(movie)) ||
+    // A kind-uncertain title (Delta kids page) is keyed as a movie at harvest time but
+    // may have been published as a series once OMDb resolved it — probe that too, so
+    // reuse still hits and the title isn't re-fetched every run.
+    (movie.kindUncertain ? idx.byBare.get(bareKey({ ...movie, kind: "series" })) : undefined);
 }
 
 // --- cross-airline identity (matchId) ---------------------------------------

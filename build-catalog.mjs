@@ -78,7 +78,10 @@ async function omdb(movie) {
     return found(j) ? j : null;
   }
   const title = cleanTitle(movie.title);
-  const type = movie.kind === "series" ? "series" : "movie";
+  // A kind-uncertain title (Delta's kids page mixes movies and series) is looked up
+  // without a type filter so OMDb's exact-title match picks the canonical record —
+  // its Type then settles the kind (see applyEnrichment).
+  const type = movie.kindUncertain ? null : movie.kind === "series" ? "series" : "movie";
   const year = movie.year;
 
   let j = await omdbRequest({ t: title, y: year, type });
@@ -131,8 +134,11 @@ async function fetchEnrichment(movie) {
 }
 
 /** Apply an enrichment result to a movie: rating fields + descriptive backfill. Keeps a
- * source-provided IMDb id even if OMDb returned no record. */
+ * source-provided IMDb id even if OMDb returned no record. A kind-uncertain title
+ * adopts the resolved record's kind first, so `backfill` applies the right field set
+ * (series keep year/runtime null). */
 function applyEnrichment(movie, enr) {
+  if (movie.kindUncertain && enr.descriptive?.kind) movie.kind = enr.descriptive.kind;
   const r = enr.rating;
   Object.assign(movie, {
     imdbRating: r?.imdbRating ?? null,
@@ -156,6 +162,8 @@ async function enrich(movies, previous, cache) {
       // Reuse only titles we already have a rating for; everything else (never matched,
       // or matched but unrated) is retried each run so improved matching and newly-added
       // ratings get picked up. Descriptive fields from the prior feed are reused too.
+      // A kind-uncertain title keeps the kind its prior run resolved to.
+      if (movie.kindUncertain && prior.kind) movie.kind = prior.kind;
       Object.assign(movie, {
         imdbRating: prior.imdbRating ?? null,
         rating: prior.rating ?? prior.imdbRating ?? null,
@@ -189,6 +197,8 @@ async function enrich(movies, previous, cache) {
     }
     applyEnrichment(movie, enr);
   }
+  // `kindUncertain` is a harvest/enrichment-time marker, not a feed field.
+  for (const movie of movies) delete movie.kindUncertain;
   console.log(`  enriched ${fetched} new via OMDb/Wikidata (${cacheHits} cache hits, ${reused} reused)`);
 }
 

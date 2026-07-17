@@ -5,7 +5,7 @@ import {
   cleanTitle, parseYear, yearWithin, pickSearchMatch,
   extractAmericanRecords, mapAmericanRecord, americanSystems, americanSystemsLegend,
   parseFlightNumber, flightCapabilities, flightSystemIds, filterCatalogForFlight,
-  decodeEntities, extractDeltaEntries, mapDeltaEntry,
+  decodeEntities, extractDeltaEntries, mapDeltaEntry, mergeDeltaPages,
   omdbDescriptive, backfill, enrichKey, itemKey, bareKey, indexPrevious, lookupPrevious,
   slugify, slugKey, assignMatchIds,
   evaluateCatalogSize, checkCatalogSizes, CATALOG_EXPECTATIONS,
@@ -396,8 +396,8 @@ test("extractDeltaEntries pulls deduped title + absolute poster", () => {
 });
 
 test("extractDeltaEntries is attribute-order-agnostic (title before src)", () => {
-  // Most of Delta's grid renders title="" ahead of the poster attribute; the old
-  // src-then-title regex missed all of it (united-movies#21).
+  // Delta's live grids currently render src-then-title, but the parser shouldn't
+  // depend on attribute order — AEM markup varies across its pages.
   const html = `
     <img title="Dune" class="poster" src="/content/dam/delta-com/products/movie-thumbs/june-2026/dune-180x250.jpg" alt="Dune"/>
     <img alt="Wicked" title="Wicked" src="/content/dam/delta-com/products/movie-thumbs/june-2026/wicked-180x250.jpg"/>`;
@@ -430,6 +430,46 @@ test("extractDeltaEntries skips thumbs images that carry no title", () => {
   }]);
 });
 
+test("extractDeltaEntries normalizes absolute poster URLs onto the base", () => {
+  // A few entries on the live TV page (e.g. The Hills, Tulsa King) carry an absolute
+  // https://www.delta.com/... src where the rest of the grid is root-relative.
+  const html = `
+    <img src="https://www.delta.com/content/dam/delta-com/products/movie-thumbs/may-2026/thehills-1-180x250.jpg" title="The Hills" alt="The Hills Poster"/>
+    <img src="/content/dam/delta-com/products/movie-thumbs/july-2026/hotones-1-180x250.jpg" title="Hot Ones" alt="Hot Ones Poster"/>`;
+  const entries = extractDeltaEntries(html);
+  assert.deepEqual(entries, [
+    { title: "The Hills", posterURL: "https://www.delta.com/content/dam/delta-com/products/movie-thumbs/may-2026/thehills-1-180x250.jpg" },
+    { title: "Hot Ones", posterURL: "https://www.delta.com/content/dam/delta-com/products/movie-thumbs/july-2026/hotones-1-180x250.jpg" },
+  ]);
+});
+
+test("mapDeltaEntry tags the kind per page; 'unknown' flags kindUncertain", () => {
+  assert.equal(mapDeltaEntry({ title: "Landman", posterURL: "p" }, "series").kind, "series");
+  const uncertain = mapDeltaEntry({ title: "Bluey", posterURL: "p" }, "unknown");
+  assert.equal(uncertain.kind, "movie", "keyed as a movie so reuse keys stay harvest-stable");
+  assert.equal(uncertain.kindUncertain, true);
+  assert.equal(mapDeltaEntry({ title: "Cars", posterURL: "p" }).kindUncertain, undefined,
+    "kind-certain entries carry no flag");
+});
+
+test("mergeDeltaPages dedupes across pages, earlier (kind-certain) pages winning", () => {
+  const items = mergeDeltaPages([
+    { kind: "movie", entries: [{ title: "GOAT", posterURL: "movie-pg" }] },
+    { kind: "series", entries: [{ title: "Dora", posterURL: "tv-pg" }] },
+    { kind: "unknown", entries: [
+      { title: "GOAT", posterURL: "kids-pg" },   // repeat of the movies page
+      { title: "dora", posterURL: "kids-pg" },   // repeat of the TV page (case-insensitive)
+      { title: "Bluey", posterURL: "kids-pg" },  // genuinely kids-only
+    ] },
+  ]);
+  assert.deepEqual(items.map((m) => [m.title, m.kind, m.kindUncertain ?? false]), [
+    ["GOAT", "movie", false],
+    ["Dora", "series", false],
+    ["Bluey", "movie", true],
+  ]);
+  assert.equal(items[0].posterURL, "movie-pg", "first page's poster wins");
+});
+
 test("mapDeltaEntry leaves everything but title/poster null for OMDb backfill", () => {
   const m = mapDeltaEntry({ title: "Coco", posterURL: "https://x/coco.jpg" });
   assert.equal(m.kind, "movie");
@@ -444,6 +484,7 @@ test("mapDeltaEntry leaves everything but title/poster null for OMDb backfill", 
 
 const OMDB_FULL = {
   Response: "True",
+  Type: "movie",
   Year: "2017",
   Runtime: "130 min",
   Genre: "Drama, Romance",
@@ -464,6 +505,13 @@ test("omdbDescriptive parses the non-rating fields", () => {
   assert.equal(d.language, "English", "first language only");
   assert.equal(d.maturityRating, "R");
   assert.deepEqual(omdbDescriptive({ Response: "False" }), {});
+});
+
+test("omdbDescriptive surfaces the record type as kind (for kind-uncertain titles)", () => {
+  assert.equal(omdbDescriptive(OMDB_FULL).kind, "movie");
+  assert.equal(omdbDescriptive({ Response: "True", Type: "series" }).kind, "series");
+  assert.equal(omdbDescriptive({ Response: "True", Type: "episode" }).kind, null,
+    "only movie/series settle a kind");
 });
 
 test("backfill fills empty fields but never overrides source-provided ones", () => {
@@ -520,6 +568,18 @@ test("lookupPrevious reuses a title whose year was backfilled between runs", () 
   assert.equal(lookupPrevious(idx, { kind: "movie", title: "Nope", year: null, seasonNumber: null }), undefined);
 });
 
+test("lookupPrevious matches a kind-uncertain title against its resolved series entry", () => {
+  // Bluey came off Delta's kids page kind-uncertain; last run OMDb resolved it to a
+  // series and it published that way. This run's fresh harvest is keyed as a movie
+  // again — reuse must still hit, or the title re-fetches OMDb every single run.
+  const prior = [{ kind: "series", title: "Bluey", year: null, imdbID: "tt7678620", imdbRating: 9.4, seasonNumber: null }];
+  const idx = indexPrevious(prior);
+  const fresh = { kind: "movie", kindUncertain: true, title: "Bluey", year: null, seasonNumber: null };
+  assert.equal(lookupPrevious(idx, fresh)?.imdbID, "tt7678620");
+  // Without the flag, a genuine movie/series title collision must NOT cross-match.
+  assert.equal(lookupPrevious(idx, { kind: "movie", title: "Bluey", year: null, seasonNumber: null }), undefined);
+});
+
 test("mapWikidataAwards splits 'X for Y' labels and dedupes", () => {
   const bindings = [
     { awardLabel: { value: "Academy Award for Best Picture" }, year: { value: "2001" } },
@@ -545,7 +605,8 @@ test("evaluateCatalogSize: healthy size returns null", () => {
 });
 
 test("evaluateCatalogSize: below the floor is an error anomaly", () => {
-  // The united-movies#21 regression: Delta harvested only 26 of hundreds of titles.
+  // The united-movies#21 scenario: Delta shipping only its single curated movies page
+  // (26 titles) when the full multi-page harvest yields ~100.
   const a = evaluateCatalogSize("delta", 26, 210);
   assert.equal(a.severity, "error");
   assert.equal(a.id, "delta");
