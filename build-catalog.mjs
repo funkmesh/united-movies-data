@@ -26,7 +26,7 @@ import { writeFile, mkdir, appendFile } from "node:fs/promises";
 import {
   mapOMDb, mapWikidataAwards, enrichKey, cleanTitle, yearWithin,
   pickSearchMatch, omdbDescriptive, backfill, indexPrevious, lookupPrevious,
-  assignMatchIds,
+  assignMatchIds, checkCatalogSizes,
 } from "./lib.mjs";
 import SOURCES from "./sources/index.mjs";
 
@@ -78,7 +78,10 @@ async function omdb(movie) {
     return found(j) ? j : null;
   }
   const title = cleanTitle(movie.title);
-  const type = movie.kind === "series" ? "series" : "movie";
+  // A kind-uncertain title (Delta's kids page mixes movies and series) is looked up
+  // without a type filter so OMDb's exact-title match picks the canonical record —
+  // its Type then settles the kind (see applyEnrichment).
+  const type = movie.kindUncertain ? null : movie.kind === "series" ? "series" : "movie";
   const year = movie.year;
 
   let j = await omdbRequest({ t: title, y: year, type });
@@ -131,8 +134,11 @@ async function fetchEnrichment(movie) {
 }
 
 /** Apply an enrichment result to a movie: rating fields + descriptive backfill. Keeps a
- * source-provided IMDb id even if OMDb returned no record. */
+ * source-provided IMDb id even if OMDb returned no record. A kind-uncertain title
+ * adopts the resolved record's kind first, so `backfill` applies the right field set
+ * (series keep year/runtime null). */
 function applyEnrichment(movie, enr) {
+  if (movie.kindUncertain && enr.descriptive?.kind) movie.kind = enr.descriptive.kind;
   const r = enr.rating;
   Object.assign(movie, {
     imdbRating: r?.imdbRating ?? null,
@@ -156,6 +162,8 @@ async function enrich(movies, previous, cache) {
       // Reuse only titles we already have a rating for; everything else (never matched,
       // or matched but unrated) is retried each run so improved matching and newly-added
       // ratings get picked up. Descriptive fields from the prior feed are reused too.
+      // A kind-uncertain title keeps the kind its prior run resolved to.
+      if (movie.kindUncertain && prior.kind) movie.kind = prior.kind;
       Object.assign(movie, {
         imdbRating: prior.imdbRating ?? null,
         rating: prior.rating ?? prior.imdbRating ?? null,
@@ -189,6 +197,8 @@ async function enrich(movies, previous, cache) {
     }
     applyEnrichment(movie, enr);
   }
+  // `kindUncertain` is a harvest/enrichment-time marker, not a feed field.
+  for (const movie of movies) delete movie.kindUncertain;
   console.log(`  enriched ${fetched} new via OMDb/Wikidata (${cacheHits} cache hits, ${reused} reused)`);
 }
 
@@ -245,6 +255,59 @@ function finalizeAirline(built) {
   return { feed: { id, displayName, version, generatedAt, month, ...envelope, movies }, changed, ok: true };
 }
 
+/** Sanity-check each successfully-harvested airline's catalog size (see
+ * `checkCatalogSizes` in lib.mjs). Emits GitHub Actions annotations + a job-summary
+ * section, writes `dist/anomalies.json`, and sets `has_anomalies`/`anomaly_count`
+ * outputs so the workflow can open a tracking issue. Never throws — a sanity check
+ * must not sink an otherwise-good build. Returns the anomalies. */
+async function reportCatalogSizes(built) {
+  const reports = built
+    .filter((b) => b.ok)
+    .map((b) => ({
+      id: b.id,
+      displayName: b.displayName,
+      count: b.movies.length,
+      previousCount: b.previous?.raw?.movies?.length ?? null,
+    }));
+
+  const anomalies = checkCatalogSizes(reports).map((a) => {
+    const displayName = reports.find((r) => r.id === a.id)?.displayName ?? a.id;
+    return { ...a, displayName };
+  });
+
+  for (const a of anomalies) {
+    const tag = a.severity === "error" ? "error" : "warning";
+    console.log(`::${tag} title=Catalog size anomaly (${a.id})::${a.displayName}: ${a.reason}`);
+  }
+
+  await writeFile("dist/anomalies.json", JSON.stringify(anomalies, null, 2));
+
+  if (process.env.GITHUB_STEP_SUMMARY && anomalies.length) {
+    const lines = [
+      "### ⚠️ Catalog size anomalies",
+      "",
+      "| Airline | Harvested | Previous | Min expected | Severity | Detail |",
+      "| --- | --- | --- | --- | --- | --- |",
+      ...anomalies.map((a) =>
+        `| ${a.displayName} | ${a.count} | ${a.previousCount ?? "—"} | ${a.expectedMin} | ${a.severity} | ${a.reason} |`),
+      "",
+    ];
+    await appendFile(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+  }
+
+  if (process.env.GITHUB_OUTPUT) {
+    await appendFile(
+      process.env.GITHUB_OUTPUT,
+      `has_anomalies=${anomalies.length > 0}\nanomaly_count=${anomalies.length}\n`,
+    );
+  }
+
+  if (anomalies.length) {
+    console.log(`\n⚠️  ${anomalies.length} catalog size anomaly(ies): ${anomalies.map((a) => a.id).join(", ")}`);
+  }
+  return anomalies;
+}
+
 async function main() {
   const only = (process.env.SOURCES || "").split(",").map((s) => s.trim()).filter(Boolean);
   const adapters = only.length ? SOURCES.filter((s) => only.includes(s.id)) : SOURCES;
@@ -296,6 +359,9 @@ async function main() {
   if (process.env.GITHUB_OUTPUT) {
     await appendFile(process.env.GITHUB_OUTPUT, `changed=${anyChanged}\n`);
   }
+
+  // Sanity-check catalog sizes and surface any anomaly (does not fail the build).
+  await reportCatalogSizes(built);
   if (failures.length === adapters.length) {
     throw new Error(`all sources failed: ${failures.join(", ")}`);
   }
