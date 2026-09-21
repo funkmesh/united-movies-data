@@ -4,9 +4,15 @@
 
 // --- geemedia content item -> app Movie shape -------------------------------
 
+// Airline feeds label some genres as one run-together word ("ConcertsLiveEvents"),
+// which is what a client would otherwise render on a filter chip. Keyed by
+// `genreKey` so a compound is recognised however the source spells it — run
+// together, spaced, or already pretty.
 const PRETTY_GENRE = {
-  ActionAdventure: "Action & Adventure",
-  SciFiFantasy: "Sci-Fi & Fantasy",
+  actionadventure: "Action & Adventure",
+  scififantasy: "Sci-Fi & Fantasy",
+  concertsliveevents: "Concerts & Live Events",
+  foodtravel: "Food & Travel",
 };
 
 const LANGUAGE_NAMES = {
@@ -16,8 +22,30 @@ const LANGUAGE_NAMES = {
   nld: "Dutch",
 };
 
+/** Canonical lookup key for a genre: case- and separator-insensitive, so
+ * "ConcertsLiveEvents", "Concerts Live Events" and the already-pretty
+ * "Concerts & Live Events" all agree. That also makes `prettyGenre` idempotent
+ * over its own output, which matters because previously-published genres flow
+ * back through the pipeline via `backfill`. */
+const genreKey = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+/** Split a CamelCase run into words: "FoodTravel" -> "Food Travel",
+ * "TVShows" -> "TV Shows". Leaves hyphenated OMDb genres ("Sci-Fi",
+ * "Reality-TV") and already-spaced names alone. */
+function splitCamelCase(s) {
+  return s
+    .replace(/([a-z\d])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+}
+
+/** Normalise a source's genre name into the label clients display. Known compounds
+ * get a hand-written label (with the "&" the source dropped); anything else falls
+ * back to splitting the CamelCase run, so a newly-appearing compound still reads as
+ * words instead of shipping as one token. */
 export function prettyGenre(name) {
-  return PRETTY_GENRE[name] ?? name;
+  const s = String(name ?? "").trim();
+  if (!s) return s;
+  return PRETTY_GENRE[genreKey(s)] ?? splitCamelCase(s).replace(/\s+/g, " ").trim();
 }
 
 function intOrNull(v) {
