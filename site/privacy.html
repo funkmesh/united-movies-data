@@ -16,8 +16,9 @@
 <p>SkyPicks is a free app, made by one person, that helps you pick what to watch
 from an airline's inflight catalog. This policy explains exactly what the app
 does and doesn't do with your information. The short version: <strong>you can
-use the whole app without an account, and if you do that, nothing about you
-leaves your phone.</strong></p>
+use the whole app without an account, and if you do that, no personal
+information about you is collected and your lists never leave your
+phone.</strong></p>
 
 <h2>Using SkyPicks without an account</h2>
 <p>No sign-in is required. Your watchlist, the titles you've marked seen, your
@@ -43,9 +44,20 @@ involved, which use it to deliver the response:</p>
     <td>Wikidata (<code>www.wikidata.org</code>), operated by the Wikimedia Foundation</td>
     <td>The words you typed in that search box.</td>
   </tr>
+  <tr>
+    <td>Starting the app</td>
+    <td>Google Firebase</td>
+    <td>
+      The app starts Google's Firebase library at launch so sign-in is ready
+      if you ever want it. Firebase registers a random identifier for this
+      installation. It isn't linked to you, carries nothing about what you do
+      in the app, isn't used for advertising, and goes away when you delete
+      the app.
+    </td>
+  </tr>
 </table>
-<p>These requests carry no account identifier, no advertising identifier, and no
-device fingerprint.</p>
+<p>None of these requests carry an account identifier, an advertising
+identifier, or anything about your lists or viewing habits.</p>
 
 <h2>Signing in (optional)</h2>
 <p>If you choose Sign in with Apple or Sign in with Google — from the one-time
@@ -71,8 +83,9 @@ documentation</a>. I do not sell or share your data with anyone else.</p>
 <h2>What SkyPicks never does</h2>
 <ul>
   <li>No advertising, and no advertising identifiers.</li>
-  <li>No analytics or usage-tracking SDKs. I do not know which screens you open
-  or which titles you look at.</li>
+  <li>No analytics or usage-tracking SDKs — Google Analytics for Firebase is
+  not part of the app. I do not know which screens you open or which titles
+  you look at.</li>
   <li>No tracking of you across other apps or websites, in the App Store's sense
   of the word.</li>
   <li>No access to contacts, photos, microphone, camera, or precise location.</li>
