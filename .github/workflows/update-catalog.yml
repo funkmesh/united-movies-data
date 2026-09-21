@@ -9,6 +9,13 @@ on:
   schedule:
     - cron: "0 9 * * *" # daily at 09:00 UTC
   workflow_dispatch:
+  # The app's public pages ship inside the same Pages artifact as the feeds,
+  # so editing one has to be able to publish on its own.
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/update-catalog.yml"
 
 permissions:
   contents: read
@@ -85,12 +92,12 @@ jobs:
             }
 
       - name: Upload Pages artifact
-        if: steps.build.outputs.changed == 'true'
+        if: steps.build.outputs.changed == 'true' || github.event_name != 'schedule'
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist
 
       - name: Deploy to GitHub Pages
         id: deployment
-        if: steps.build.outputs.changed == 'true'
+        if: steps.build.outputs.changed == 'true' || github.event_name != 'schedule'
         uses: actions/deploy-pages@v4

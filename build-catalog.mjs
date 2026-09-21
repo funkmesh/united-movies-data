@@ -22,7 +22,7 @@
 //      SOURCES      (optional; comma list of airline ids to build, e.g. "delta").
 
 import { createHash } from "node:crypto";
-import { writeFile, mkdir, appendFile } from "node:fs/promises";
+import { writeFile, mkdir, appendFile, cp } from "node:fs/promises";
 import {
   mapOMDb, mapWikidataAwards, enrichKey, cleanTitle, yearWithin,
   pickSearchMatch, omdbDescriptive, backfill, indexPrevious, lookupPrevious,
@@ -314,6 +314,10 @@ async function main() {
   if (adapters.length === 0) throw new Error(`no matching sources for SOURCES=${process.env.SOURCES}`);
 
   await mkdir("dist", { recursive: true });
+  // The Pages artifact is dist/ alone, so the app's public pages (privacy
+  // policy, support, landing) have to be copied in on every build or they'd
+  // vanish from the site the next time the catalog deploys.
+  await cp("site", "dist", { recursive: true });
   const cache = new Map();
 
   // Phase 1: harvest + enrich every airline.
