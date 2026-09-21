@@ -162,7 +162,48 @@ test("mapItem drops sections, tv_show umbrellas, and empty titles", () => {
 
 test("prettyGenre normalizes concatenated genre names", () => {
   assert.equal(prettyGenre("SciFiFantasy"), "Sci-Fi & Fantasy");
+  assert.equal(prettyGenre("ActionAdventure"), "Action & Adventure");
+  assert.equal(prettyGenre("ConcertsLiveEvents"), "Concerts & Live Events");
+  assert.equal(prettyGenre("FoodTravel"), "Food & Travel");
   assert.equal(prettyGenre("Drama"), "Drama");
+});
+
+test("prettyGenre splits unknown CamelCase runs into words", () => {
+  // A compound we haven't hand-labelled still has to read as words rather than
+  // shipping as one run-together token.
+  assert.equal(prettyGenre("HomeImprovement"), "Home Improvement");
+  assert.equal(prettyGenre("TVShows"), "TV Shows");
+});
+
+test("prettyGenre leaves already-readable genre names alone", () => {
+  // OMDb's hyphenated names and American's spaced ones must pass through intact.
+  for (const g of ["Sci-Fi", "Reality-TV", "Talk-Show", "Game-Show", "Film-Noir",
+                   "Coming Of Age", "Factual Entertainment", "Comedy", "Kids"]) {
+    assert.equal(prettyGenre(g), g);
+  }
+});
+
+test("prettyGenre is idempotent and case-insensitive over compounds", () => {
+  // Previously-published genres flow back through the pipeline via `backfill`, so
+  // re-normalizing an already-pretty label must be a no-op — and a source spelling
+  // the same compound differently has to land on the one label.
+  assert.equal(prettyGenre("Concerts & Live Events"), "Concerts & Live Events");
+  assert.equal(prettyGenre("Action & Adventure"), "Action & Adventure");
+  assert.equal(prettyGenre("Sci-fi & Fantasy"), "Sci-Fi & Fantasy");
+  assert.equal(prettyGenre("Concerts Live Events"), "Concerts & Live Events");
+});
+
+test("mapItem prettifies concatenated genres from the source attributes", () => {
+  const m = mapItem({
+    template: "tv_series",
+    id: "1",
+    title: "Pati Jinich Explores Panamericana",
+    attributes: [
+      { name: "FoodTravel", type: "genre" },
+      { name: "Documentary", type: "genre" },
+    ],
+  });
+  assert.deepEqual(m.genres, ["Food & Travel", "Documentary"]);
 });
 
 test("mapOMDb extracts IMDb/RT/Metacritic and awards", () => {
