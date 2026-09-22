@@ -27,7 +27,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function clearCheckpoint(page) {
   const resp = await page.goto(SECTIONS[0], { waitUntil: "networkidle2", timeout: 90000 });
   for (let i = 0; i < 15; i++) {
-    if (!/security checkpoint/i.test(await page.title())) return;
+    // Reading the title races the interstitial's own reload, which tears down the
+    // execution context out from under us; that throw means "still on it", not a failure.
+    let title = "security checkpoint";
+    try { title = await page.title(); } catch {}
+    if (!/security checkpoint/i.test(title)) return;
     await sleep(2000); // the interstitial solves itself, then reloads into the app
   }
   throw new Error(`stuck on Vercel's security checkpoint (HTTP ${resp?.status() ?? "?"}) — it no longer clears in headless Chrome`);
