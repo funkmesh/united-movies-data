@@ -238,7 +238,7 @@ async function harvestAirline(adapter, cache) {
     } else {
       console.log(`  no previous ${id} feed to fall back on — skipping`);
     }
-    return { id, displayName, previous, ok: false, reuse: previous?.raw ?? null };
+    return { id, displayName, previous, ok: false, reuse: previous?.raw ?? null, error: err.message };
   }
 }
 
@@ -308,6 +308,51 @@ async function reportCatalogSizes(built) {
   return anomalies;
 }
 
+/** Surface airlines whose harvest failed. The size check above cannot catch these by
+ * construction: a failed harvest republishes the previous feed unchanged, so its count
+ * is identical to yesterday's and looks perfectly healthy — which is how American went
+ * stale for eleven days while every run reported a clean build. Writes
+ * `dist/failures.json` and sets `has_failures`/`failure_count` so the workflow can track
+ * it. Never throws (an all-sources failure is raised by the caller). Returns them. */
+async function reportHarvestFailures(built) {
+  const failures = built
+    .filter((b) => !b.ok)
+    .map((b) => ({
+      id: b.id,
+      displayName: b.displayName,
+      error: b.error ?? "unknown error",
+      reusedCount: b.reuse ? (b.reuse.movies ?? []).length : null,
+      reusedFrom: b.reuse?.generatedAt ?? null,
+    }));
+
+  for (const f of failures) {
+    console.log(`::error title=Harvest failed (${f.id})::${f.displayName}: ${f.error}`);
+  }
+
+  await writeFile("dist/failures.json", JSON.stringify(failures, null, 2));
+
+  if (process.env.GITHUB_STEP_SUMMARY && failures.length) {
+    const lines = [
+      "### ❌ Harvest failures",
+      "",
+      "| Airline | Error | Serving instead | Published |",
+      "| --- | --- | --- | --- |",
+      ...failures.map((f) =>
+        `| ${f.displayName} | ${f.error} | ${f.reusedCount ?? "—"} titles | ${f.reusedFrom ?? "—"} |`),
+      "",
+    ];
+    await appendFile(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+  }
+
+  if (process.env.GITHUB_OUTPUT) {
+    await appendFile(
+      process.env.GITHUB_OUTPUT,
+      `has_failures=${failures.length > 0}\nfailure_count=${failures.length}\n`,
+    );
+  }
+  return failures;
+}
+
 async function main() {
   const only = (process.env.SOURCES || "").split(",").map((s) => s.trim()).filter(Boolean);
   const adapters = only.length ? SOURCES.filter((s) => only.includes(s.id)) : SOURCES;
@@ -366,6 +411,7 @@ async function main() {
 
   // Sanity-check catalog sizes and surface any anomaly (does not fail the build).
   await reportCatalogSizes(built);
+  await reportHarvestFailures(built);
   if (failures.length === adapters.length) {
     throw new Error(`all sources failed: ${failures.join(", ")}`);
   }

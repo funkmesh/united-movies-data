@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   mapItem, mapOMDb, parseAwards, mapWikidataAwards, prettyGenre,
   cleanTitle, parseYear, yearWithin, pickSearchMatch,
-  extractAmericanRecords, mapAmericanRecord, americanSystems, americanSystemsLegend,
+  extractAmericanRecords, classifyAmericanPage, mapAmericanRecord, americanSystems, americanSystemsLegend,
   parseFlightNumber, flightCapabilities, flightSystemIds, filterCatalogForFlight,
   decodeEntities, extractDeltaEntries, mapDeltaEntry, mergeDeltaPages,
   omdbDescriptive, backfill, enrichKey, itemKey, bareKey, indexPrevious, lookupPrevious,
@@ -357,6 +357,41 @@ test("americanSystems falls back to the flat id list when rich objects are absen
 test("mapAmericanRecord tags the title with its systemIds (for flight matching)", () => {
   assert.deepEqual(mapAmericanRecord(AA_REC_SYS).systemIds, [5, 24]);
   assert.deepEqual(mapAmericanRecord(AA_REC).systemIds, [], "no systems -> empty");
+});
+
+// A listing page as the site actually serves it: the records live in the flight payload,
+// and an exhausted page still renders (same chrome, same `__next_f`) with none in it.
+// The Vercel interstitial served to a non-browser client carries neither.
+const AA_CHALLENGE_HTML =
+  '<!DOCTYPE html><html lang="en"><head><title>Vercel Security Checkpoint</title></head>' +
+  '<body><p>Verifying your browser before you continue.</p></body></html>';
+const AA_EMPTY_PAGE_HTML = '<script>self.__next_f.push([1,"{\\"page\\":99,\\"data\\":{\\"movies\\":[]}}"])</script>';
+
+test("classifyAmericanPage reads a populated listing page as records", () => {
+  const c = classifyAmericanPage(200, americanPage(AA_REC));
+  assert.equal(c.state, "records");
+  assert.equal(c.records.length, 1);
+  assert.equal(c.records[0].name, "Avatar: Fire and Ash");
+});
+
+test("classifyAmericanPage calls out Vercel's challenge instead of reporting no records", () => {
+  // The regression that stalled the feed: a plain fetch gets 429 + the interstitial, and
+  // the old harvester read that as "past the last page" and published a stale cache.
+  const blocked = classifyAmericanPage(429, AA_CHALLENGE_HTML);
+  assert.equal(blocked.state, "blocked");
+  assert.match(blocked.detail, /429/);
+  assert.match(blocked.detail, /checkpoint/i);
+  // The interstitial is a block even when it is served with a 200.
+  assert.equal(classifyAmericanPage(200, AA_CHALLENGE_HTML).state, "blocked");
+  // So is any other non-2xx, and any response without a flight payload at all.
+  assert.equal(classifyAmericanPage(503, "<html>down</html>").state, "blocked");
+  assert.equal(classifyAmericanPage(200, "<html>not the app</html>").state, "blocked");
+});
+
+test("classifyAmericanPage reads an exhausted page as empty, not blocked", () => {
+  const c = classifyAmericanPage(200, AA_EMPTY_PAGE_HTML);
+  assert.equal(c.state, "empty", "a real page with no records — the end of a section, or a shape change on page 1");
+  assert.deepEqual(c.records, []);
 });
 
 test("americanSystemsLegend unions systems across records", () => {

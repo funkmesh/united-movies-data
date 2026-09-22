@@ -24,11 +24,14 @@ one enrichment pass and publishing step across all of them:
    - **United** (`sources/united.mjs`) — runs `unitedprivatescreening.com` (a geemedia
      Angular SPA) in headless Chromium and collects the `content/items` JSON it fetches
      for itself (movies + TV).
-   - **American** (`sources/american.mjs`) — fetches `entertainment.aa.com/en/movies`
-     and `/en/series` (a Next.js site, paginated `?page=N`) server-side and reads the
-     records embedded in each page's flight payload. Provides an IMDb id per title, and
-     tags each title with the IFE `systemIds` that carry it (the feed envelope publishes
-     a `systems` legend) — see Flight mode below.
+   - **American** (`sources/american.mjs`) — reads the records embedded in the flight
+     payload of `entertainment.aa.com/en/movies` and `/en/series` (a Next.js site,
+     paginated `?page=N`). The site runs Vercel's Attack Challenge Mode, which answers a
+     plain fetch with HTTP 429 on every path, so it loads the site once in headless
+     Chromium and then reads each page with a same-origin fetch from inside the cleared
+     page. Provides an IMDb id per title, and tags each title with the IFE `systemIds`
+     that carry it (the feed envelope publishes a `systems` legend) — see Flight mode
+     below.
    - **Delta** (`sources/delta.mjs`) — fetches the server-rendered "current movies" page
      and parses out title + poster. It's a curated subset of the onboard catalog with no
      other metadata, so the rest is backfilled from OMDb.
