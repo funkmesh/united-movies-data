@@ -293,6 +293,31 @@ export function extractAmericanRecords(html) {
   return [...out.values()];
 }
 
+/** What a fetched American listing page actually is, so a failed harvest names its cause
+ * instead of collapsing to "0 items". Three outcomes:
+ *   blocked — the listing never reached us: a non-2xx, or Vercel's challenge interstitial
+ *             served in place of the app. Since ~2026-09-10 entertainment.aa.com runs
+ *             Vercel's Attack Challenge Mode, which answers every path (robots.txt
+ *             included) with HTTP 429 + `x-vercel-mitigated: challenge` unless the client
+ *             is a real browser holding the clearance cookie.
+ *   empty   — a genuine listing page carrying no records.
+ *   records — the records the page carries.
+ * Position, not content, separates "past the last page" from "the payload changed shape":
+ * an exhausted page and a hypothetical reshaped one are alike but for their records, so
+ * the caller decides (page 1 empty is a shape change; page 2+ empty is the end). */
+export function classifyAmericanPage(status, html) {
+  const text = String(html ?? "");
+  const challenged = /Vercel Security Checkpoint/i.test(text);
+  if (status !== 200) {
+    return { state: "blocked", records: [], detail: `HTTP ${status}${challenged ? " (Vercel security checkpoint)" : ""}` };
+  }
+  if (challenged) return { state: "blocked", records: [], detail: "Vercel security checkpoint served instead of the listing" };
+  if (!text.includes("__next_f")) return { state: "blocked", records: [], detail: "response carries no Next.js flight payload" };
+  const records = extractAmericanRecords(text);
+  if (records.length === 0) return { state: "empty", records: [], detail: "flight payload carries no records" };
+  return { state: "records", records, detail: null };
+}
+
 /** The onboard IFE systems a title is available on, deduped by id, from a record's
  * nested summaries/programming. Each: { id, system, name, oem, seatback, device }.
  * Per-flight availability is a function of which system a given aircraft carries, so
