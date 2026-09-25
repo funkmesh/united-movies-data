@@ -9,6 +9,7 @@ import {
   omdbDescriptive, backfill, enrichKey, itemKey, bareKey, indexPrevious, lookupPrevious,
   slugify, slugKey, assignMatchIds,
   evaluateCatalogSize, checkCatalogSizes, CATALOG_EXPECTATIONS,
+  tmdbPosterPath, tmdbPosterURL, isoDay, reusablePoster, TMDB_IMAGE_BASE,
 } from "./lib.mjs";
 
 test("slugify: year-independent, accent/punctuation-folded, article-stripped", () => {
@@ -693,4 +694,53 @@ test("checkCatalogSizes: reports only the anomalous airlines", () => {
   ]);
   assert.equal(anomalies.length, 1);
   assert.equal(anomalies[0].id, "delta");
+});
+
+// ── TMDB posters ────────────────────────────────────────────────────────────
+
+test("tmdbPosterPath prefers the result type matching the title's kind", () => {
+  const find = {
+    movie_results: [{ poster_path: "/movie.jpg" }],
+    tv_results: [{ poster_path: "/tv.jpg" }],
+  };
+  assert.equal(tmdbPosterPath(find, "movie"), "/movie.jpg");
+  assert.equal(tmdbPosterPath(find, "series"), "/tv.jpg");
+});
+
+test("tmdbPosterPath falls back to the other type, and to null", () => {
+  assert.equal(tmdbPosterPath({ movie_results: [], tv_results: [{ poster_path: "/tv.jpg" }] }, "movie"), "/tv.jpg");
+  assert.equal(tmdbPosterPath({ movie_results: [{ poster_path: null }], tv_results: [] }, "movie"), null);
+  assert.equal(tmdbPosterPath({}, "movie"), null);
+  assert.equal(tmdbPosterPath(null, "movie"), null);
+});
+
+test("tmdbPosterURL builds an image.tmdb.org URL, or null", () => {
+  assert.equal(tmdbPosterURL("/abc.jpg"), `${TMDB_IMAGE_BASE}/abc.jpg`);
+  assert.ok(tmdbPosterURL("/abc.jpg").startsWith("https://image.tmdb.org/"));
+  assert.equal(tmdbPosterURL(null), null);
+});
+
+test("isoDay is a plain date", () => {
+  assert.equal(isoDay(new Date("2026-09-25T23:59:00Z")), "2026-09-25");
+});
+
+test("reusablePoster reuses a recent TMDB lookup, hit or miss", () => {
+  const now = new Date("2026-09-25T00:00:00Z");
+  assert.equal(reusablePoster({ posterURL: `${TMDB_IMAGE_BASE}/a.jpg`, posterCheckedAt: "2026-09-01" }, now), true);
+  assert.equal(reusablePoster({ posterURL: null, posterCheckedAt: "2026-09-01" }, now), true);
+});
+
+test("reusablePoster refetches before TMDB's 6-month caching limit", () => {
+  const now = new Date("2026-09-25T00:00:00Z");
+  assert.equal(reusablePoster({ posterURL: `${TMDB_IMAGE_BASE}/a.jpg`, posterCheckedAt: "2026-06-01" }, now), false);
+});
+
+test("reusablePoster never carries forward an airline-CDN poster", () => {
+  const now = new Date("2026-09-25T00:00:00Z");
+  // What every feed published before the TMDB switch looks like.
+  assert.equal(reusablePoster({ posterURL: "https://cms-scdn.airtime.geemedia.com/p.jpg" }, now), false);
+  // Even if it somehow carried a check date.
+  assert.equal(reusablePoster({ posterURL: "https://cms-scdn.airtime.geemedia.com/p.jpg", posterCheckedAt: "2026-09-20" }, now), false);
+  assert.equal(reusablePoster(undefined, now), false);
+  assert.equal(reusablePoster({ posterCheckedAt: "not a date" }, now), false);
 });
