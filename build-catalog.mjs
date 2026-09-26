@@ -302,12 +302,18 @@ async function harvestAirline(adapter, cache) {
     return { id, displayName, envelope, movies, previous, ok: true };
   } catch (err) {
     console.error(`  ✗ ${id} failed: ${err.message}`);
-    if (previous?.raw) {
-      console.log(`  reusing previously-published ${id}.json (${(previous.raw.movies ?? []).length} titles)`);
-    } else {
+    if (!previous?.raw) {
       console.log(`  no previous ${id} feed to fall back on — skipping`);
+      return { id, displayName, previous, ok: false, reuse: null };
     }
-    return { id, displayName, previous, ok: false, reuse: previous?.raw ?? null };
+    console.log(`  reusing previously-published ${id}.json (${(previous.raw.movies ?? []).length} titles)`);
+    // The titles are reused, but the posters are re-sourced: a feed published
+    // before the switch to TMDB still carries airline artwork, and one that
+    // keeps failing would otherwise carry it — or let its TMDB lookups age
+    // past TMDB's caching limit — indefinitely.
+    const reuse = structuredClone(previous.raw);
+    await sourcePosters(reuse.movies ?? [], previous, cache);
+    return { id, displayName, previous, ok: false, reuse };
   }
 }
 
@@ -315,7 +321,24 @@ async function harvestAirline(adapter, cache) {
  * failed airline reuses its previously-published feed (no version change). */
 function finalizeAirline(built) {
   const { id, displayName, envelope, movies, previous, ok, reuse } = built;
-  if (!ok) return { feed: reuse, changed: false, ok: false };
+  if (!ok) {
+    if (!reuse) return { feed: null, changed: false, ok: false };
+    // A reused feed is re-hashed the same way as a fresh one, so re-sourced
+    // posters give it a new version (and a deploy) while an untouched reuse
+    // keeps its old one.
+    const { id: _id, displayName: _name, version: oldVersion, generatedAt: oldGeneratedAt,
+      month: _month, movies: reusedMovies = [], ...reusedEnvelope } = reuse;
+    const version = createHash("sha256")
+      .update(stableStringify({ ...reusedEnvelope, movies: reusedMovies }))
+      .digest("hex").slice(0, 16);
+    const changed = version !== oldVersion;
+    if (changed) console.log(`  ${id}: reused feed re-versioned ${oldVersion} → ${version} (posters re-sourced)`);
+    return {
+      feed: { ...reuse, version, generatedAt: changed ? new Date().toISOString() : oldGeneratedAt },
+      changed,
+      ok: false,
+    };
+  }
   const version = createHash("sha256").update(stableStringify({ ...envelope, movies })).digest("hex").slice(0, 16);
   const changed = !previous || previous.version !== version;
   const generatedAt = changed ? new Date().toISOString() : (previous?.generatedAt ?? new Date().toISOString());
