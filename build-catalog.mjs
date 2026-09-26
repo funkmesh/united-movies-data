@@ -18,6 +18,7 @@
 // continues; the run only fails if every airline fails.
 //
 // Env: OMDB_API_KEY (required for enrichment; absent => ratings/awards left null).
+// Env: TMDB_API_KEY (poster source; absent => every title is published without a poster).
 //      PAGES_BASE   (optional; base URL of the published feeds, for prior-feed reuse).
 //      SOURCES      (optional; comma list of airline ids to build, e.g. "delta").
 
@@ -27,11 +28,14 @@ import {
   mapOMDb, mapWikidataAwards, enrichKey, cleanTitle, yearWithin,
   pickSearchMatch, omdbDescriptive, backfill, indexPrevious, lookupPrevious,
   assignMatchIds, checkCatalogSizes,
+  tmdbPosterPath, tmdbPosterURL, isoDay, reusablePoster,
 } from "./lib.mjs";
 import SOURCES from "./sources/index.mjs";
 
 const PAGES_BASE = process.env.PAGES_BASE || "https://funkmesh.github.io/united-movies-data";
 const OMDB_KEY = process.env.OMDB_API_KEY || "";
+// TMDB v3 API key or v4 read-access token (either works; see tmdbFind).
+const TMDB_KEY = process.env.TMDB_API_KEY || "";
 const WIKIDATA_UA = "inflight-movie-picker/1.0 (catalog enrichment; https://github.com/funkmesh/united-movies-data)";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -202,6 +206,70 @@ async function enrich(movies, previous, cache) {
   console.log(`  enriched ${fetched} new via OMDb/Wikidata (${cacheHits} cache hits, ${reused} reused)`);
 }
 
+/** TMDB `/find` by IMDb id. Accepts a v3 API key (query param) or a v4 read-access
+ * token (a JWT, sent as a bearer token). Returns null on any failure. */
+async function tmdbFind(imdbID) {
+  const url = new URL(`https://api.themoviedb.org/3/find/${encodeURIComponent(imdbID)}`);
+  url.searchParams.set("external_source", "imdb_id");
+  const headers = { Accept: "application/json" };
+  if (TMDB_KEY.startsWith("eyJ")) headers.Authorization = `Bearer ${TMDB_KEY}`;
+  else url.searchParams.set("api_key", TMDB_KEY);
+  try {
+    const resp = await fetch(url, { headers });
+    if (!resp.ok) {
+      if (resp.status === 401) throw new Error("TMDB rejected the API key (401)");
+      return null;
+    }
+    return await resp.json();
+  } catch (err) {
+    if (err.message.includes("401")) throw err;
+    return null;
+  }
+}
+
+/** Replace every harvested poster with TMDB's, or with null. The airline's own
+ * artwork is never kept — see the Posters note in lib.mjs. Lookups are shared
+ * across airlines via `cache` and reused from the previous feed while younger than
+ * POSTER_MAX_AGE_DAYS (TMDB's terms cap caching at 6 months). */
+async function sourcePosters(movies, previous, cache) {
+  const now = new Date();
+  const today = isoDay(now);
+  let fetched = 0, reused = 0, hits = 0, missing = 0;
+  if (!TMDB_KEY) {
+    console.warn("  ⚠ TMDB_API_KEY not set — publishing every title without a poster");
+  }
+  for (const movie of movies) {
+    movie.posterURL = null;
+    movie.posterCheckedAt = null;
+    if (!movie.imdbID) { missing++; continue; }
+    const prior = lookupPrevious(previous?.index, movie);
+    if (reusablePoster(prior, now)) {
+      movie.posterURL = prior.posterURL ?? null;
+      movie.posterCheckedAt = prior.posterCheckedAt;
+      reused++;
+      continue;
+    }
+    if (!TMDB_KEY) continue;
+    const key = `tmdb:${movie.imdbID}`;
+    let url = cache.get(key);
+    if (url !== undefined) {
+      hits++;
+    } else {
+      const find = await tmdbFind(movie.imdbID);
+      url = find ? tmdbPosterURL(tmdbPosterPath(find, movie.kind)) : null;
+      // A failed request isn't cached, so it's retried next run rather than
+      // pinned as "no poster" for three months.
+      if (find) cache.set(key, url);
+      fetched++;
+      await sleep(40); // TMDB allows ~50 req/s; stay well under
+      if (!find) continue;
+    }
+    movie.posterURL = url;
+    movie.posterCheckedAt = today;
+  }
+  console.log(`  posters: ${fetched} TMDB lookups, ${hits} cache hits, ${reused} reused, ${missing} without IMDb id`);
+}
+
 function stableStringify(value) {
   return JSON.stringify(value, (_k, v) =>
     v && typeof v === "object" && !Array.isArray(v)
@@ -230,6 +298,7 @@ async function harvestAirline(adapter, cache) {
     console.log(`  harvested ${movies.length} items (${movieCount} movies, ${movies.length - movieCount} series)`);
 
     await enrich(movies, previous, cache);
+    await sourcePosters(movies, previous, cache);
     return { id, displayName, envelope, movies, previous, ok: true };
   } catch (err) {
     console.error(`  ✗ ${id} failed: ${err.message}`);

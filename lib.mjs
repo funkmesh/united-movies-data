@@ -707,3 +707,47 @@ export function checkCatalogSizes(reports, opts = {}) {
     .map((r) => evaluateCatalogSize(r.id, r.count, r.previousCount, opts[r.id]))
     .filter(Boolean);
 }
+
+// ── Posters (TMDB) ──────────────────────────────────────────────────────────
+//
+// Posters come from TMDB, never from the airline's own media CDN: App Review
+// rejected the app under guideline 5.2.1 for showing studio artwork it had no
+// permission to hotlink from there. TMDB's API terms allow a free, ad-free app
+// to show its images with attribution, and forbid caching anything obtained
+// from it for more than 6 months — so each poster lookup carries the date it
+// was made and is redone well inside that window.
+
+export const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w342";
+export const POSTER_MAX_AGE_DAYS = 90;
+
+/** The poster path from a TMDB `/find/{imdb_id}` response, preferring the result
+ * type that matches the title's kind (a series' IMDb id resolves to a TV result). */
+export function tmdbPosterPath(find, kind) {
+  const movie = find?.movie_results?.[0];
+  const tv = find?.tv_results?.[0];
+  const ordered = kind === "series" ? [tv, movie] : [movie, tv];
+  for (const r of ordered) if (r?.poster_path) return r.poster_path;
+  return null;
+}
+
+export function tmdbPosterURL(path) {
+  return path ? `${TMDB_IMAGE_BASE}${path}` : null;
+}
+
+/** YYYY-MM-DD — the granularity `posterCheckedAt` is stored at, so a feed's hash
+ * only changes on the day a lookup is actually redone. */
+export function isoDay(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+/** Whether a previously-published title's TMDB lookup can be reused as-is: it must
+ * have been a TMDB lookup (it has `posterCheckedAt`, and any URL is TMDB's) and be
+ * younger than POSTER_MAX_AGE_DAYS. A miss (null URL) is reusable too, so titles
+ * TMDB doesn't know aren't re-queried every run. */
+export function reusablePoster(prior, now, maxAgeDays = POSTER_MAX_AGE_DAYS) {
+  if (!prior?.posterCheckedAt) return false;
+  if (prior.posterURL && !prior.posterURL.startsWith(TMDB_IMAGE_BASE)) return false;
+  const checked = Date.parse(prior.posterCheckedAt);
+  if (Number.isNaN(checked)) return false;
+  return (now.getTime() - checked) / 86_400_000 < maxAgeDays;
+}
