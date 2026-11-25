@@ -13,7 +13,7 @@ export default {
         "https://www.unitedprivatescreening.com/movies",
         "https://www.unitedprivatescreening.com/tv",
       ],
-      apiPattern: /api\/v3\/content\/items/,
+      apiPattern: /api\/v\d+\/content\/items/,
       userAgent: UA,
     });
   },

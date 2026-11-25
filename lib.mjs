@@ -432,11 +432,14 @@ export function extractDeltaEntries(html, base = "https://www.delta.com") {
   const imgTagRe = /<img\b([^>]+)>/gi;
   const srcRe = /\b(?:data-src|src)="(?:https?:\/\/[^"/]*delta\.com)?(\/content\/dam\/delta-com\/products\/[^"]*thumbs[^"]+)"/i;
   const titleRe = /\btitle="([^"]+)"/i;
+  // Since Nov 2026 Delta's grids carry no title attr, only alt="<Title> Poster".
+  // Only alts in that form are trusted, so arbitrary alt text isn't read as a title.
+  const altPosterRe = /\balt="([^"]+?)\s+Poster\s*"/i;
   for (const tagMatch of String(html).matchAll(imgTagRe)) {
     const attrs = tagMatch[1];
     const srcMatch = srcRe.exec(attrs);
     if (!srcMatch) continue;
-    const titleMatch = titleRe.exec(attrs);
+    const titleMatch = titleRe.exec(attrs) ?? altPosterRe.exec(attrs);
     if (!titleMatch) continue;
     const title = decodeEntities(titleMatch[1]).trim();
     if (title && !seen.has(title)) seen.set(title, base + srcMatch[1]);

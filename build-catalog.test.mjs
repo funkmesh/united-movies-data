@@ -472,6 +472,17 @@ test("extractDeltaEntries skips thumbs images that carry no title", () => {
   }]);
 });
 
+test("extractDeltaEntries falls back to an alt of the form '<Title> Poster'", () => {
+  // Delta's Nov 2026 markup dropped the title attr; the name survives only in alt.
+  const html = `
+    <img class="rounded-03" src="/content/dam/delta-com/products/movie-thumbs/nov-2026/minionsmonsters-180x250.jpg" alt="Minions &amp; Monsters Poster " width="180"/>
+    <img class="rounded-03" src="/content/dam/delta-com/products/movie-thumbs/nov-2026/merv-180x250.jpg" alt="Merv Poster" width="180"/>
+    <img class="rounded-03" src="/content/dam/delta-com/products/movie-thumbs/nov-2026/merv-180x250.jpg" alt="Merv Poster" width="180"/>`;
+  const entries = extractDeltaEntries(html);
+  assert.deepEqual(entries.map((e) => e.title), ["Minions & Monsters", "Merv"]);
+  assert.equal(entries[1].posterURL, "https://www.delta.com/content/dam/delta-com/products/movie-thumbs/nov-2026/merv-180x250.jpg");
+});
+
 test("extractDeltaEntries normalizes absolute poster URLs onto the base", () => {
   // A few entries on the live TV page (e.g. The Hills, Tulsa King) carry an absolute
   // https://www.delta.com/... src where the rest of the grid is root-relative.
